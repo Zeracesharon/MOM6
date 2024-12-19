@@ -798,8 +798,8 @@ subroutine Update_Stokes_Drift(G, GV, US, CS, dz, ustar, dt, dynamics_step)
         MidPoint = 0.0
         do k = 1,GV%ke
           Top = Bottom
-          MidPoint = Bottom - 0.25*(dz(I,j,k)+dz(I-1,j,k))
-          Bottom = Bottom - 0.5*(dz(I,j,k)+dz(I-1,j,k))
+          MidPoint = Bottom - 0.25*(dz(i,j,k)+dz(i+1,j,k))
+          Bottom = Bottom - 0.5*(dz(i,j,k)+dz(i+1,j,k))
           CS%Us_x(I,j,k) = CS%TP_STKX0*exp(MidPoint*DecayScale)
         enddo
       enddo
@@ -810,8 +810,8 @@ subroutine Update_Stokes_Drift(G, GV, US, CS, dz, ustar, dt, dynamics_step)
         MidPoint = 0.0
         do k = 1,GV%ke
           Top = Bottom
-          MidPoint = Bottom - 0.25*(dz(i,J,k)+dz(i,J-1,k))
-          Bottom = Bottom - 0.5*(dz(i,J,k)+dz(i,J-1,k))
+          MidPoint = Bottom - 0.25*(dz(i,j,k)+dz(i,j+1,k))
+          Bottom = Bottom - 0.5*(dz(i,j,k)+dz(i,j+1,k))
           CS%Us_y(i,J,k) = CS%TP_STKY0*exp(MidPoint*DecayScale)
         enddo
       enddo
@@ -837,7 +837,7 @@ subroutine Update_Stokes_Drift(G, GV, US, CS, dz, ustar, dt, dynamics_step)
         bottom = 0.0
         do k = 1,GV%ke
           Top = Bottom
-          level_thick = 0.5*(dz(I,j,k)+dz(I-1,j,k))
+          level_thick = 0.5*(dz(i,j,k)+dz(i+1,j,k))
           MidPoint = Top - 0.5*level_thick
           Bottom = Top - level_thick
 
@@ -894,7 +894,7 @@ subroutine Update_Stokes_Drift(G, GV, US, CS, dz, ustar, dt, dynamics_step)
         bottom = 0.0
         do k = 1,GV%ke
           Top = Bottom
-          level_thick = 0.5*(dz(i,J,k)+dz(i,J-1,k))
+          level_thick = 0.5*(dz(i,j,k)+dz(i,j+1,k))
           MidPoint = Top - 0.5*level_thick
           Bottom = Top - level_thick
 
@@ -947,8 +947,8 @@ subroutine Update_Stokes_Drift(G, GV, US, CS, dz, ustar, dt, dynamics_step)
           bottom = 0.0
           do k = 1,GV%ke
             Top = Bottom
-            MidPoint = Top - 0.25*(dz(I,j,k)+dz(I-1,j,k))
-            Bottom = Top - 0.5*(dz(I,j,k)+dz(I-1,j,k))
+            MidPoint = Top - 0.25*(dz(i,j,k)+dz(i+1,j,k))
+            Bottom = Top - 0.5*(dz(i,j,k)+dz(i+1,j,k))
             !bgr note that this is using a u-point I on h-point ustar
             !    this code has only been previous used for uniform
             !    grid cases.  This needs fixed if DHH85 is used for non
@@ -964,8 +964,8 @@ subroutine Update_Stokes_Drift(G, GV, US, CS, dz, ustar, dt, dynamics_step)
           Bottom = 0.0
           do k = 1,GV%ke
             Top = Bottom
-            MidPoint = Bottom - 0.25*(dz(i,J,k)+dz(i,J-1,k))
-            Bottom = Bottom - 0.5*(dz(i,J,k)+dz(i,J-1,k))
+            MidPoint = Bottom - 0.25*(dz(i,j,k)+dz(i,j+1,k))
+            Bottom = Bottom - 0.5*(dz(i,j+1,k)+dz(i,j+1,k))
             !bgr note that this is using a v-point J on h-point ustar
             !    this code has only been previous used for uniform
             !    grid cases.  This needs fixed if DHH85 is used for non
@@ -1244,7 +1244,7 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
 
   if (Waves%WaveMethod==TESTPROF) then
     do k = 1,GV%ke
-      US_H(k) = 0.5*(Waves%US_X(I,j,k)+Waves%US_X(I-1,j,k))
+      US_H(k) = 0.5*(Waves%US_X(I,j,k)+Waves%US_X(I+1,j,k))
       VS_H(k) = 0.5*(Waves%US_Y(i,J,k)+Waves%US_Y(i,J-1,k))
     enddo
     call Get_SL_Average_Prof( GV, Dpt_LASL, dz, US_H, LA_STKx)
@@ -1253,7 +1253,7 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
   elseif (Waves%WaveMethod==SURFBANDS) then
     allocate(StkBand_X(Waves%NumBands), StkBand_Y(Waves%NumBands))
     do bb = 1,Waves%NumBands
-      StkBand_X(bb) = 0.5*(Waves%STKx0(I,j,bb)+Waves%STKx0(I-1,j,bb))
+      StkBand_X(bb) = 0.5*(Waves%STKx0(I,j,bb)+Waves%STKx0(I+1,j,bb))
       StkBand_Y(bb) = 0.5*(Waves%STKy0(i,J,bb)+Waves%STKy0(i,J-1,bb))
     enddo
     call Get_SL_Average_Band(GV, Dpt_LASL, Waves%NumBands, Waves%WaveNum_Cen, StkBand_X, LA_STKx )
@@ -1263,7 +1263,7 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
   elseif (Waves%WaveMethod==DHH85) then
     ! Temporarily integrating profile rather than spectrum for simplicity
     do k = 1,GV%ke
-      US_H(k) = 0.5*(Waves%US_X(I,j,k)+Waves%US_X(I-1,j,k))
+      US_H(k) = 0.5*(Waves%US_X(I,j,k)+Waves%US_X(I+1,j,k))
       VS_H(k) = 0.5*(Waves%US_Y(i,J,k)+Waves%US_Y(i,J-1,k))
     enddo
     call Get_SL_Average_Prof( GV, Dpt_LASL, dz, US_H, LA_STKx)
@@ -1688,8 +1688,8 @@ subroutine CoriolisStokes(G, GV, dt, h, u, v, Waves)
   do k = 1, GV%ke
     do j = G%jsc, G%jec
       do I = G%iscB, G%iecB
-        DVel = 0.25*((Waves%us_y(i,J+1,k)+Waves%us_y(i-1,J+1,k)) * G%CoriolisBu(I,J+1)) + &
-               0.25*((Waves%us_y(i,J,k)+Waves%us_y(i-1,J,k)) * G%CoriolisBu(I,J))
+        DVel = 0.25*((Waves%us_y(i,j+1,k)+Waves%us_y(i+1,j+1,k)) * G%CoriolisBu(i,j+1)) + &
+               0.25*((Waves%us_y(i,j,k)+Waves%us_y(i+1,j,k)) * G%CoriolisBu(i,j))
         u(I,j,k) = u(I,j,k) + DVEL*dt
       enddo
     enddo
@@ -1698,8 +1698,8 @@ subroutine CoriolisStokes(G, GV, dt, h, u, v, Waves)
   do k = 1, GV%ke
     do J = G%jscB, G%jecB
       do i = G%isc, G%iec
-        DVel = 0.25*((Waves%us_x(I+1,j,k)+Waves%us_x(I+1,j-1,k)) * G%CoriolisBu(I+1,J)) + &
-               0.25*((Waves%us_x(I,j,k)+Waves%us_x(I,j-1,k)) * G%CoriolisBu(I,J))
+        DVel = 0.25*((Waves%us_x(i+1,j,k)+Waves%us_x(i+1,j+1,k)) * G%CoriolisBu(i+1,j)) + &
+               0.25*((Waves%us_x(i,j,k)+Waves%us_x(i,j+1,k)) * G%CoriolisBu(i,j))
         v(i,J,k) = v(i,j,k) - DVEL*dt
       enddo
     enddo
