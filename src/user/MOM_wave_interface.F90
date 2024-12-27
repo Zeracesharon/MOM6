@@ -965,7 +965,7 @@ subroutine Update_Stokes_Drift(G, GV, US, CS, dz, ustar, dt, dynamics_step)
           do k = 1,GV%ke
             Top = Bottom
             MidPoint = Bottom - 0.25*(dz(i,j,k)+dz(i,j+1,k))
-            Bottom = Bottom - 0.5*(dz(i,j+1,k)+dz(i,j+1,k))
+            Bottom = Bottom - 0.5*(dz(i,j,k)+dz(i,j+1,k))
             !bgr note that this is using a v-point J on h-point ustar
             !    this code has only been previous used for uniform
             !    grid cases.  This needs fixed if DHH85 is used for non
