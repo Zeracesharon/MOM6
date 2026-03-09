@@ -65,16 +65,20 @@
 SHELL = bash
 
 # No implicit rules, suffixes, or variables
-MAKEFLAGS += -rR
+MAKEFLAGS += --no-builtin-rules
+MAKEFLAGS += --no-builtin-variables
+
+.SUFFIXES:
 
 # Determine the MOM6 autoconf srcdir
-AC_SRCDIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../ac
+CODEBASE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))..
+AC_SRCDIR := $(CODEBASE)/ac
 
 # User-defined configuration
 -include config.mk
 
 # Set the FMS library
-FMS_COMMIT ?= 2023.03
+FMS_COMMIT ?= 2025.02.01
 FMS_URL ?= https://github.com/NOAA-GFDL/FMS.git
 export FMS_COMMIT
 export FMS_URL
@@ -140,6 +144,10 @@ WORKSPACE ?= .
 BUILD ?= $(WORKSPACE)/build
 DEPS ?= $(BUILD)/deps
 WORK ?= $(WORKSPACE)/work
+
+# External tools
+MAKEDEP ?= $(abspath $(AC_SRCDIR)/makedep)
+PKG ?= $(abspath $(CODEBASE)/pkg)
 
 # Experiment configuration
 EXECS ?= symmetric/MOM6 asymmetric/MOM6 openmp/MOM6
@@ -210,10 +218,8 @@ endif
 
 ## Rules
 
-.PHONY: all build.regressions build.prof
+.PHONY: all
 all: $(foreach b,$(EXECS),$(BUILD)/$(b))
-build.regressions: $(foreach b,symmetric target,$(BUILD)/$(b)/MOM6)
-build.prof: $(foreach b,opt opt_target,$(BUILD)/$(b)/MOM6)
 
 # Executable
 .PRECIOUS: $(foreach b,$(EXECS),$(BUILD)/$(b))
@@ -227,7 +233,7 @@ LDFLAGS_DEPS = -L$(abspath $(DEPS)/lib)
 PATH_DEPS = PATH="${PATH}:$(abspath $(DEPS)/bin)"
 
 
-# Define the build targets in terms of the traditional DEBUG/REPRO/etc labels
+# Compiler flags
 SYMMETRIC_FCFLAGS := FCFLAGS="$(FCFLAGS_DEBUG) $(FCFLAGS_INIT) $(FCFLAGS_DEPS)"
 ASYMMETRIC_FCFLAGS := FCFLAGS="$(FCFLAGS_DEBUG) $(FCFLAGS_INIT) $(FCFLAGS_DEPS)"
 REPRO_FCFLAGS := FCFLAGS="$(FCFLAGS_REPRO) $(FCFLAGS_DEPS)"
@@ -236,9 +242,9 @@ OPENMP_FCFLAGS := FCFLAGS="$(FCFLAGS_DEBUG) $(FCFLAGS_INIT) $(FCFLAGS_DEPS)"
 TARGET_FCFLAGS := FCFLAGS="$(FCFLAGS_DEBUG) $(FCFLAGS_INIT) $(FCFLAGS_DEPS)"
 COV_FCFLAGS := FCFLAGS="$(FCFLAGS_COVERAGE) $(FCFLAGS_DEPS)"
 
+# Linker flags
 MOM_LDFLAGS := LDFLAGS="$(LDFLAGS_DEPS) $(LDFLAGS_USER)"
 COV_LDFLAGS := LDFLAGS="$(LDFLAGS_COVERAGE) $(LDFLAGS_DEPS) $(LDFLAGS_USER)"
-
 
 # Environment variable configuration
 MOM_ENV := $(PATH_FMS)
@@ -268,12 +274,16 @@ $(BUILD)/timing/Makefile: MOM_ACFLAGS += --with-driver=timing_tests
 .NOTPARALLEL:$(foreach e,$(UNIT_EXECS),$(BUILD)/unit/$(e))
 $(BUILD)/unit/test_%: $(BUILD)/unit/Makefile FORCE
 	cd $(@D) && $(TIME) $(MAKE) $(@F)
-$(BUILD)/unit/Makefile: $(foreach e,$(UNIT_EXECS),../config_src/drivers/unit_tests/$(e).F90)
+
+$(BUILD)/unit/Makefile: \
+  $(foreach e,$(UNIT_EXECS),../config_src/drivers/unit_tests/$(e).F90)
 
 .NOTPARALLEL:$(foreach e,$(TIMING_EXECS),$(BUILD)/timing/$(e))
 $(BUILD)/timing/time_%: $(BUILD)/timing/Makefile FORCE
 	cd $(@D) && $(TIME) $(MAKE) $(@F)
-$(BUILD)/timing/Makefile: $(foreach e,$(TIMING_EXECS),../config_src/drivers/timing_tests/$(e).F90)
+
+$(BUILD)/timing/Makefile: \
+  $(foreach e,$(TIMING_EXECS),../config_src/drivers/timing_tests/$(e).F90)
 
 $(BUILD)/%/MOM6: $(BUILD)/%/Makefile FORCE
 	cd $(@D) && $(TIME) $(MAKE) $(@F)
@@ -285,7 +295,13 @@ $(BUILD)/target/MOM6: $(BUILD)/target FORCE | $(TARGET_CODEBASE)
 $(BUILD)/target: | $(TARGET_CODEBASE)
 	ln -s $(abspath $(TARGET_CODEBASE))/.testing/build/symmetric $@
 
-FORCE:
+$(BUILD)/opt_target/MOM6: $(BUILD)/opt_target FORCE | $(TARGET_CODEBASE)
+	$(MAKE) -C $(TARGET_CODEBASE)/.testing BUILD=build build/opt/MOM6
+
+$(BUILD)/opt_target: | $(TARGET_CODEBASE)
+	ln -s $(abspath $(TARGET_CODEBASE))/.testing/build/opt $@
+
+.PHONY: FORCE
 
 
 ## Use autoconf to construct the Makefile for each target
@@ -300,7 +316,7 @@ FORCE:
 $(BUILD)/%/Makefile: $(BUILD)/%/Makefile.in $(BUILD)/%/config.status
 	cd $(@D) && ./config.status
 
-$(BUILD)/%/config.status: $(BUILD)/%/configure $(DEPS)/lib/libFMS.a
+$(BUILD)/%/config.status: $(BUILD)/%/configure $(DEPS)/lib/libFMS.a $(DEPS)/lib/libgsw.a $(DEPS)/lib/libcvmix.a
 	cd $(@D) && $(MOM_ENV) ./configure -n --srcdir=$(AC_SRCDIR) $(MOM_ACFLAGS) \
 	 || (cat config.log && false)
 
@@ -321,25 +337,26 @@ ALL_EXECS = symmetric asymmetric repro openmp opt opt_target coupled nuopc \
 $(foreach b,$(ALL_EXECS),$(BUILD)/$(b)/):
 	mkdir -p $@
 
+ifdef DO_REGRESSION_TESTS
 # Fetch the regression target codebase
 $(TARGET_CODEBASE):
 	git clone --recursive $(MOM_TARGET_URL) $@
 	cd $@ && git checkout --recurse-submodules $(MOM_TARGET_BRANCH)
+endif
 
 
-## FMS
+## Dependencies
 
 # Set up the FMS build environment variables
-FMS_ENV = \
-  PATH="${PATH}:$(realpath ../ac)" \
+DEPS_ENV = \
   FCFLAGS="$(FCFLAGS_FMS)" \
+  MAKEDEP=$(MAKEDEP) \
   REPORT_ERROR_LOGS="$(REPORT_ERROR_LOGS)"
 
-$(DEPS)/lib/libFMS.a: $(DEPS)/Makefile $(DEPS)/Makefile.fms.in $(DEPS)/configure.fms.ac $(DEPS)/m4
-	$(FMS_ENV) $(MAKE) -C $(DEPS) lib/libFMS.a
+# FMS
 
-$(DEPS)/Makefile: ../ac/deps/Makefile | $(DEPS)
-	cp ../ac/deps/Makefile $(DEPS)/Makefile
+$(DEPS)/lib/libFMS.a: $(DEPS)/Makefile $(DEPS)/Makefile.fms.in $(DEPS)/configure.fms.ac $(DEPS)/m4
+	$(DEPS_ENV) $(MAKE) -C $(DEPS) lib/libFMS.a
 
 $(DEPS)/Makefile.fms.in: ../ac/deps/Makefile.fms.in | $(DEPS)
 	cp ../ac/deps/Makefile.fms.in $(DEPS)/Makefile.fms.in
@@ -347,11 +364,39 @@ $(DEPS)/Makefile.fms.in: ../ac/deps/Makefile.fms.in | $(DEPS)
 $(DEPS)/configure.fms.ac: ../ac/deps/configure.fms.ac | $(DEPS)
 	cp ../ac/deps/configure.fms.ac $(DEPS)/configure.fms.ac
 
+# GSW
+
+$(DEPS)/lib/libgsw.a: $(DEPS)/Makefile $(DEPS)/Makefile.gsw.in $(DEPS)/configure.gsw.ac $(DEPS)/m4
+	$(DEPS_ENV) PKG=$(PKG) $(MAKE) -C $(DEPS) lib/libgsw.a
+
+$(DEPS)/Makefile.gsw.in: ../ac/deps/Makefile.gsw.in | $(DEPS)
+	cp ../ac/deps/Makefile.gsw.in $(DEPS)/Makefile.gsw.in
+
+$(DEPS)/configure.gsw.ac: ../ac/deps/configure.gsw.ac | $(DEPS)
+	cp ../ac/deps/configure.gsw.ac $(DEPS)/configure.gsw.ac
+
+# CVMix
+
+$(DEPS)/lib/libcvmix.a: $(DEPS)/Makefile $(DEPS)/Makefile.cvmix.in $(DEPS)/configure.cvmix.ac $(DEPS)/m4
+	$(DEPS_ENV) PKG=$(PKG) $(MAKE) -C $(DEPS) lib/libcvmix.a
+
+$(DEPS)/Makefile.cvmix.in: ../ac/deps/Makefile.cvmix.in | $(DEPS)
+	cp ../ac/deps/Makefile.cvmix.in $(DEPS)/Makefile.cvmix.in
+
+$(DEPS)/configure.cvmix.ac: ../ac/deps/configure.cvmix.ac | $(DEPS)
+	cp ../ac/deps/configure.cvmix.ac $(DEPS)/configure.cvmix.ac
+
+# Generic dependency content
+
+$(DEPS)/Makefile: ../ac/deps/Makefile | $(DEPS)
+	cp ../ac/deps/Makefile $(DEPS)/Makefile
+
 $(DEPS)/m4: ../ac/deps/m4 | $(DEPS)
 	cp -r ../ac/deps/m4 $(DEPS)/
 
 $(DEPS):
 	mkdir -p $(DEPS)
+
 
 #---
 # Verify that the coupled model drivers can be compiled.  This does not verify
@@ -494,14 +539,10 @@ $(foreach c,$(CONFIGS),$(eval $(call CONFIG_DIM_RULE,$(c))))
 # Regression testing only checks for changes in existing diagnostics
 .PRECIOUS: $(WORK)/%/target/chksum_diag
 %.regression.diag: $(foreach b,symmetric target,$(WORK)/%/$(b)/chksum_diag)
-	@! diff $^ | grep "^[<>]" | grep "^>" > /dev/null \
-	  || ! (\
-	    mkdir -p $(WORK)/results/$*; \
-	    (diff $^ | tee $(WORK)/results/$*/chksum_diag.regression.diff | head -n 20) ; \
+	@tools/diff_diag.sh $^ || ! (\
 	    echo -e "$(FAIL): Diagnostics $*.regression.diag have changed." \
 	  )
-	@cmp $^ || ( \
-	  diff $^ | head -n 20; \
+	@tools/cmp_diag.sh $^ || ( \
 	  echo -e "$(WARN): New diagnostics in $<" \
 	)
 	@echo -e "$(PASS): Diagnostics $*.regression.diag agree."
@@ -545,8 +586,8 @@ $(WORK)/%/$(1)/ocean.stats $(WORK)/%/$(1)/chksum_diag: $(BUILD)/$(2)/MOM6 | prep
 	  && $(TIME) $(5) $(MPIRUN) -n $(6) $$(abspath $$<) 2> std.err > std.out \
 	  || !( \
 	    mkdir -p ../../../results/$$*/ ; \
-	    cat std.out | tee ../../../results/$$*/std.$(1).out | tail -n 40 ; \
-	    cat std.err | tee ../../../results/$$*/std.$(1).err | tail -n 40 ; \
+	    cat std.out | tee ../../../results/$$*/std.$(1).out | tail -n 100 ; \
+	    cat std.err | tee ../../../results/$$*/std.$(1).err | tail -n 100 ; \
 	    rm ocean.stats chksum_diag ; \
 	    echo -e "$(FAIL): $$*.$(1) failed at runtime." \
 	  )
@@ -603,7 +644,6 @@ $(eval $(call STAT_RULE,dim.h,symmetric,,H_RESCALE_POWER=11,,1))
 $(eval $(call STAT_RULE,dim.z,symmetric,,Z_RESCALE_POWER=11,,1))
 $(eval $(call STAT_RULE,dim.q,symmetric,,Q_RESCALE_POWER=11,,1))
 $(eval $(call STAT_RULE,dim.r,symmetric,,R_RESCALE_POWER=11,,1))
-
 $(eval $(call STAT_RULE,cov,cov,true,,,1))
 
 # Generate the half-period input namelist as follows:
@@ -629,8 +669,8 @@ $(WORK)/%/restart/ocean.stats: $(BUILD)/symmetric/MOM6 | preproc
 	# Run the first half-period
 	cd $(@D) && $(TIME) $(MPIRUN) -n 1 $(abspath $<) 2> std1.err > std1.out \
 	  || !( \
-	    cat std1.out | tee ../../../results/$*/std.restart1.out | tail -n 40 ; \
-	    cat std1.err | tee ../../../results/$*/std.restart1.err | tail -n 40 ; \
+	    cat std1.out | tee ../../../results/$*/std.restart1.out | tail -n 100 ; \
+	    cat std1.err | tee ../../../results/$*/std.restart1.err | tail -n 100 ; \
 	    echo -e "$(FAIL): $*.restart failed at runtime." \
 	  )
 	# Setup the next inputs
@@ -640,8 +680,8 @@ $(WORK)/%/restart/ocean.stats: $(BUILD)/symmetric/MOM6 | preproc
 	# Run the second half-period
 	cd $(@D) && $(TIME) $(MPIRUN) -n 1 $(abspath $<) 2> std2.err > std2.out \
 	  || !( \
-	    cat std2.out | tee ../../../results/$*/std.restart2.out | tail -n 40 ; \
-	    cat std2.err | tee ../../../results/$*/std.restart2.err | tail -n 40 ; \
+	    cat std2.out | tee ../../../results/$*/std.restart2.out | tail -n 100 ; \
+	    cat std2.err | tee ../../../results/$*/std.restart2.err | tail -n 100 ; \
 	    echo -e "$(FAIL): $*.restart failed at runtime." \
 	  )
 
@@ -662,33 +702,50 @@ test.summary:
 run.cov.unit: $(foreach t,$(UNIT_EXECS),$(BUILD)/unit/$(t).F90.gcov)
 
 .PHONY: build.unit
+.NOTPARALLEL: build.unit
 build.unit: $(foreach f, $(UNIT_EXECS), $(BUILD)/unit/$(f))
+
 .PHONY: run.unit
 run.unit: $(foreach f, $(UNIT_EXECS), work/unit/$(f).out)
+
 .PHONY: build.timing
+.NOTPARALLEL: build.timing
 build.timing: $(foreach f, $(TIMING_EXECS), $(BUILD)/timing/$(f))
+
 .PHONY: run.timing
 run.timing: $(foreach f, $(TIMING_EXECS), work/timing/$(f).out)
+
 .PHONY: show.timing
 show.timing: $(foreach f, $(TIMING_EXECS), work/timing/$(f).show)
+
 $(WORK)/timing/%.show:
 	./tools/disp_timing.py $(@:.show=.out)
 
 
-# Invoke the above unit/timing rules for a "target" code
-# Invoke with appropriate macros defines, i.e.
-#   make build.timing_target MOM_TARGET_URL=... MOM_TARGET_BRANCH=... TARGET_CODEBASE=$(BUILD)/target_codebase
-#   make run.timing_target TARGET_CODEBASE=$(BUILD)/target_codebase
+# Invoke the above unit/timing rules for a "target" code, e.g.
+#   make \
+#     MOM_TARGET_URL=... \
+#     MOM_TARGET_BRANCH=... \
+#     TARGET_CODEBASE=$(BUILD)/target_codebase \
+#     build.timing_target
+#   make TARGET_CODEBASE=$(BUILD)/target_codebase run.timing_target
 
-TIMING_TARGET_EXECS ?= $(basename $(notdir $(wildcard $(TARGET_CODEBASE)/config_src/drivers/timing_tests/*.F90) ) )
+TIMING_TARGET_EXECS ?= \
+  $(basename $(notdir $(wildcard $(TARGET_CODEBASE)/config_src/drivers/timing_tests/*.F90)))
 
 .PHONY: build.timing_target
-build.timing_target: $(foreach f, $(TIMING_TARGET_EXECS), $(TARGET_CODEBASE)/.testing/$(BUILD)/timing/$(f))
+build.timing_target: \
+  $(foreach f, $(TIMING_TARGET_EXECS), $(TARGET_CODEBASE)/.testing/$(BUILD)/timing/$(f))
+
 .PHONY: run.timing_target
-run.timing_target: $(foreach f, $(TIMING_TARGET_EXECS), $(TARGET_CODEBASE)/.testing/work/timing/$(f).out)
+run.timing_target: \
+  $(foreach f, $(TIMING_TARGET_EXECS), $(TARGET_CODEBASE)/.testing/work/timing/$(f).out)
+
 .PHONY: compare.timing
-compare.timing: $(foreach f, $(filter $(TIMING_EXECS),$(TIMING_TARGET_EXECS)), work/timing/$(f).compare)
-$(WORK)/timing/%.compare: $(TARGET_CODEBASE)
+compare.timing: \
+  $(foreach f, $(filter $(TIMING_EXECS),$(TIMING_TARGET_EXECS)), work/timing/$(f).compare)
+$(WORK)/timing/%.compare: \
+  $(TARGET_CODEBASE)
 	./tools/disp_timing.py -r $(TARGET_CODEBASE)/.testing/$(@:.compare=.out) $(@:.compare=.out)
 $(TARGET_CODEBASE)/.testing/%: | $(TARGET_CODEBASE)
 	cd $(TARGET_CODEBASE)/.testing && make $*

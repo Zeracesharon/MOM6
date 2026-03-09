@@ -11,7 +11,7 @@ use MOM_dyn_horgrid, only : dyn_horgrid_type
 use MOM_error_handler, only : MOM_mesg, MOM_error, FATAL, WARNING, is_root_pe
 use MOM_error_handler, only : callTree_enter, callTree_leave, callTree_waypoint
 use MOM_file_parser, only : get_param, log_param, param_file_type, log_version
-use MOM_io, only : create_MOM_file, file_exists, field_size
+use MOM_io, only : create_MOM_file, file_exists, field_size, get_filename_appendix
 use MOM_io, only : MOM_infra_file, MOM_field
 use MOM_io, only : MOM_read_data, MOM_read_vector, read_variable, stdout
 use MOM_io, only : open_file_to_read, close_file_to_read, SINGLE_FILE, MULTIPLE
@@ -30,6 +30,7 @@ public reset_face_lengths_named, reset_face_lengths_file, reset_face_lengths_lis
 public read_face_length_list, set_velocity_depth_max, set_velocity_depth_min
 public set_subgrid_topo_at_vel_from_file
 public compute_global_grid_integrals, write_ocean_geometry_file
+public set_meanSL_from_file
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -136,6 +137,41 @@ function diagnoseMaximumDepth(D, G)
   call max_across_PEs(diagnoseMaximumDepth)
 end function diagnoseMaximumDepth
 
+!> Read time mean ocean sea level from a file
+subroutine set_meanSL_from_file(meanSL, G, param_file, US)
+  type(dyn_horgrid_type),           intent(in)  :: G !< The dynamic horizontal grid type
+  real, dimension(G%isd:G%ied,G%jsd:G%jed), &
+                                    intent(out) :: meanSL !< Mean sea level referenced to a zero
+                                                          !! reference height at tracer points [Z ~> m].
+  type(param_file_type),            intent(in)  :: param_file !< Parameter file structure
+  type(unit_scale_type),            intent(in)  :: US !< A dimensional unit scaling type
+  ! Local variables
+  character(len=200) :: filename, file, inputdir ! Strings for file/path
+  character(len=200) :: varname                  ! Variable name in file
+  character(len=40)  :: mdl = "set_meanSL_from_file" ! This subroutine's name.
+  integer :: i, j
+
+  call callTree_enter(trim(mdl)//"(), MOM_shared_initialization.F90")
+
+  call get_param(param_file, mdl, "INPUTDIR", inputdir, default=".")
+  inputdir = slasher(inputdir)
+  call get_param(param_file, mdl, "MEAN_SEA_LEVEL_FILE", file, &
+                 "The file from which the mean sea level is read.", &
+                 default="mean_sea_level.nc")
+  call get_param(param_file, mdl, "MEAN_SEA_LEVEL_VARNAME", varname, &
+                 "The name of the mean sea level variable in MEAN_SEA_LEVEL_FILE.", &
+                 default="meanSL")
+  filename = trim(inputdir)//trim(file)
+  call log_param(param_file, mdl, "INPUTDIR/TOPO_FILE", filename)
+
+  if (.not.file_exists(filename, G%Domain)) &
+    call MOM_error(FATAL, " "//mdl//": Unable to open "//trim(filename))
+
+  call MOM_read_data(filename, trim(varname), meanSL, G%Domain, scale=US%m_to_Z)
+  call pass_var(meanSL, G%Domain)
+
+  call callTree_leave(trim(mdl)//'()')
+end subroutine set_meanSL_from_file
 
 !> Read gridded depths from file
 subroutine initialize_topography_from_file(D, G, param_file, US)
@@ -485,7 +521,6 @@ subroutine set_rotation_beta_plane(f, G, param_file, US)
   real    :: f_0    ! The reference value of the Coriolis parameter [T-1 ~> s-1]
   real    :: beta   ! The meridional gradient of the Coriolis parameter [T-1 L-1 ~> s-1 m-1]
   real    :: beta_lat_ref ! The reference latitude for the beta plane [degrees_N] or [km] or [m]
-  real    :: Rad_Earth_L  ! The radius of the planet in rescaled units [L ~> m]
   real    :: y_scl  ! A scaling factor from the units of latitude [L lat-1 ~> m lat-1]
   real    :: PI     ! The ratio of the circumference of a circle to its diameter [nondim]
   character(len=40)  :: mdl = "set_rotation_beta_plane" ! This subroutine's name.
@@ -503,18 +538,16 @@ subroutine set_rotation_beta_plane(f, G, param_file, US)
   call get_param(param_file, mdl, "AXIS_UNITS", axis_units, default="degrees")
 
   PI = 4.0*atan(1.0)
+  y_scl = G%grid_unit_to_L
+  if (G%grid_unit_to_L <= 0.0) y_scl = PI * G%Rad_Earth_L / 180.
+
   select case (axis_units(1:1))
     case ("d")
-      call get_param(param_file, mdl, "RAD_EARTH", Rad_Earth_L, &
-                   "The radius of the Earth.", units="m", default=6.378e6, scale=US%m_to_L)
       beta_lat_ref_units = "degrees"
-      y_scl = PI * Rad_Earth_L / 180.
     case ("k")
       beta_lat_ref_units = "kilometers"
-      y_scl = 1.0e3 * US%m_to_L
     case ("m")
       beta_lat_ref_units = "meters"
-      y_scl = 1.0 * US%m_to_L
     case default ; call MOM_error(FATAL, &
       " set_rotation_beta_plane: unknown AXIS_UNITS = "//trim(axis_units))
   end select
@@ -887,6 +920,8 @@ subroutine reset_face_lengths_list(G, param_file, US)
 
     ! Count the number of u_width and v_width entries.
     call read_face_length_list(iounit, filename, num_lines, lines)
+  else
+    num_lines = 0
   endif
 
   len_lon = 360.0 ; if (G%len_lon > 0.0) len_lon = G%len_lon
@@ -1313,15 +1348,15 @@ subroutine compute_global_grid_integrals(G, US)
   type(unit_scale_type),  intent(in)    :: US !< A dimensional unit scaling type
 
   ! Local variables
-  real, dimension(G%isc:G%iec, G%jsc:G%jec) :: tmpForSumming ! Masked and unscaled cell areas [m2]
+  real, dimension(G%isc:G%iec, G%jsc:G%jec) :: masked_area ! Masked cell areas [L2 ~> m2]
   integer :: i, j
 
-  tmpForSumming(:,:) = 0.
+  masked_area(:,:) = 0.
   G%areaT_global = 0.0 ; G%IareaT_global = 0.0
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    tmpForSumming(i,j) = G%areaT(i,j) * G%mask2dT(i,j)
+    masked_area(i,j) = G%areaT(i,j) * G%mask2dT(i,j)
   enddo ; enddo
-  G%areaT_global = US%L_to_m**2 * reproducing_sum(tmpForSumming, unscale=US%L_to_m**2)
+  G%areaT_global = reproducing_sum(masked_area, unscale=US%L_to_m**2)
 
   if (G%areaT_global == 0.0) &
     call MOM_error(FATAL, "compute_global_grid_integrals: zero ocean area (check topography?)")
@@ -1344,6 +1379,7 @@ subroutine write_ocean_geometry_file(G, param_file, directory, US, geom_file)
   ! Local variables.
   character(len=240) :: filepath  ! The full path to the file to write
   character(len=40)  :: mdl = "write_ocean_geometry_file"
+  character(len=32)  :: filename_appendix = '' ! Appendix to geom filename for ensemble runs
   type(vardesc),   dimension(:), allocatable :: &
     vars     ! Types with metadata about the variables and their staggering
   type(MOM_field), dimension(:), allocatable :: &
@@ -1351,6 +1387,7 @@ subroutine write_ocean_geometry_file(G, param_file, directory, US, geom_file)
   type(MOM_infra_file) :: IO_handle ! The I/O handle of the fileset
   integer :: nFlds ! The number of variables in this file
   integer :: file_threading
+  integer :: geom_file_len ! geometry file name length
   logical :: multiple_files
 
   call callTree_enter('write_ocean_geometry_file()')
@@ -1402,6 +1439,17 @@ subroutine write_ocean_geometry_file(G, param_file, directory, US, geom_file)
     filepath = trim(directory) // trim(geom_file)
   else
     filepath = trim(directory) // "ocean_geometry"
+  endif
+
+  ! Append ensemble run number to filename if it is an ensemble run
+  call get_filename_appendix(filename_appendix)
+  if (len_trim(filename_appendix) > 0) then
+    geom_file_len = len_trim(filepath)
+    if (filepath(geom_file_len-2:geom_file_len) == ".nc") then
+      filepath = filepath(1:geom_file_len-3) // '.' // trim(filename_appendix) // ".nc"
+    else
+      filepath = filepath // '.' // trim(filename_appendix)
+    endif
   endif
 
   call get_param(param_file, mdl, "PARALLEL_RESTARTFILES", multiple_files, &

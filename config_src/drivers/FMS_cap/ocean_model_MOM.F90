@@ -32,7 +32,6 @@ use MOM_EOS, only : gsw_sp_from_sr, gsw_pt_from_ct
 use MOM_file_parser, only : get_param, log_version, close_param_file, param_file_type
 use MOM_forcing_type, only : forcing, mech_forcing, allocate_forcing_type
 use MOM_forcing_type, only : fluxes_accumulate, get_net_mass_forcing
-use MOM_forcing_type, only : copy_back_forcing_fields
 use MOM_forcing_type, only : forcing_diagnostics, mech_forcing_diags
 use MOM_get_input, only : Get_MOM_Input, directories
 use MOM_grid, only : ocean_grid_type
@@ -341,7 +340,7 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
   call get_param(param_file, mdl, "RHO_0", Rho0, &
                  "The mean ocean density used with BOUSSINESQ true to "//&
                  "calculate accelerations and the mass for conservation "//&
-                 "properties, or with BOUSSINSEQ false to convert some "//&
+                 "properties, or with BOUSSINESQ false to convert some "//&
                  "parameters from vertical units of m to kg m-2.", &
                  units="kg m-3", default=1035.0, scale=OS%US%kg_m3_to_R)
   call get_param(param_file, mdl, "G_EARTH", G_Earth, &
@@ -373,7 +372,8 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
 
   !allocate(OS%sfc_state)
   call allocate_surface_state(OS%sfc_state, OS%grid, use_temperature, do_integrals=.true., &
-                              gas_fields_ocn=gas_fields_ocn, use_meltpot=use_melt_pot)
+                              gas_fields_ocn=gas_fields_ocn, use_meltpot=use_melt_pot, &
+                              use_iceshelves=OS%use_ice_shelf)
 
   if (present(wind_stagger)) then
     call surface_forcing_init(Time_in, OS%grid, OS%US, param_file, OS%diag, &

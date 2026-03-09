@@ -5,7 +5,7 @@ module regional_dyes
 
 use MOM_coms,               only : EFP_type
 use MOM_coupler_types,      only : set_coupler_type_data, atmos_ocn_coupler_flux
-use MOM_diag_mediator,      only : diag_ctrl
+use MOM_diag_mediator,      only : diag_ctrl, post_data, register_diag_field
 use MOM_error_handler,      only : MOM_error, FATAL, WARNING
 use MOM_file_parser,        only : get_param, log_param, log_version, param_file_type
 use MOM_forcing_type,       only : forcing
@@ -24,6 +24,7 @@ use MOM_tracer_Z_init,      only : tracer_Z_init
 use MOM_unit_scaling,       only : unit_scale_type
 use MOM_variables,          only : surface, thermo_var_ptrs
 use MOM_verticalGrid,       only : verticalGrid_type
+use MOM_tracer_advect_schemes, only : set_tracer_advect_scheme, TracerAdvectionSchemeDoc
 
 implicit none ; private
 
@@ -58,12 +59,14 @@ type, public :: dye_tracer_CS ; private
   integer, allocatable, dimension(:) :: ind_tr !< Indices returned by atmos_ocn_coupler_flux if it is used and the
                                                !! surface tracer concentrations are to be provided to the coupler.
 
+  integer, allocatable, dimension(:) :: id_tr_dia_diff !< Diagnostic IDs for vertical tracer fluxes (positive up)
+
   type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to
                                    !! regulate the timing of diagnostic output.
   type(MOM_restart_CS), pointer :: restart_CSp => NULL() !< A pointer to the restart control structure
 
   type(vardesc), allocatable :: tr_desc(:) !< Descriptions and metadata for the tracers
-  logical :: tracers_may_reinit = .false. !< If true the tracers may be initialized if not found in a restart file
+  logical :: tracers_may_reinit = .true. !< If true the tracers may be initialized if not found in a restart file
 end type dye_tracer_CS
 
 contains
@@ -85,11 +88,15 @@ function register_dye_tracer(HI, GV, US, param_file, CS, tr_Reg, restart_CS)
   character(len=40)  :: mdl = "regional_dyes" ! This module's name.
   character(len=48)  :: var_name ! The variable's name.
   character(len=48)  :: desc_name ! The variable's descriptor.
+  character(len=48)  :: param_name ! The param's name suffix.
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
   real, pointer :: tr_ptr(:,:,:) => NULL() ! A pointer to one of the tracers [CU ~> conc]
   logical :: register_dye_tracer
   integer :: isd, ied, jsd, jed, nz, m
+  integer :: advect_scheme   ! Advection scheme value for this tracer
+  character(len=256) :: mesg ! Advection scheme name for this tracer
+
   isd = HI%isd ; ied = HI%ied ; jsd = HI%jsd ; jed = HI%jed ; nz = GV%ke
 
   if (associated(CS)) then
@@ -111,6 +118,8 @@ function register_dye_tracer(HI, GV, US, param_file, CS, tr_Reg, restart_CS)
            CS%dye_source_maxdepth(CS%ntr))
   allocate(CS%ind_tr(CS%ntr))
   allocate(CS%tr_desc(CS%ntr))
+  allocate(CS%id_tr_dia_diff(CS%ntr))
+  CS%id_tr_dia_diff(:) = -1
 
   CS%dye_source_minlon(:) = -1.e30
   call get_param(param_file, mdl, "DYE_SOURCE_MINLON", CS%dye_source_minlon, &
@@ -156,11 +165,19 @@ function register_dye_tracer(HI, GV, US, param_file, CS, tr_Reg, restart_CS)
                  "This is the maximum depth at which we inject dyes.", &
                  units="m", scale=US%m_to_Z, fail_if_missing=.true.)
   if (minval(CS%dye_source_maxdepth(:)) < -1.e29*US%m_to_Z) &
-    call MOM_error(FATAL, "register_dye_tracer: Not enough values provided for DYE_SOURCE_MAXDEPTH ")
+    call MOM_error(FATAL, "register_dye_tracer: Not enough values provided for DYE_SOURCE_MAXDEPTH")
 
   allocate(CS%tr(isd:ied,jsd:jed,nz,CS%ntr), source=0.0)
 
   do m = 1, CS%ntr
+    write(param_name(:),'(A,I3.3,A)') "DYE",m,"_TRACER_ADVECTION_SCHEME"
+    call get_param(param_file, mdl, trim(param_name), mesg, &
+          desc="The horizontal transport scheme for dye tracer:\n"//&
+          trim(TracerAdvectionSchemeDoc)//&
+          "\n Set to blank (the default) to use TRACER_ADVECTION_SCHEME.", default="")
+    ! Get the integer value of the tracer scheme
+    call set_tracer_advect_scheme(advect_scheme, mesg)
+
     write(var_name(:),'(A,I3.3)') "dye",m
     write(desc_name(:),'(A,I3.3)') "Dye Tracer ",m
     CS%tr_desc(m) = var_desc(trim(var_name), "conc", trim(desc_name), caller=mdl)
@@ -173,7 +190,8 @@ function register_dye_tracer(HI, GV, US, param_file, CS, tr_Reg, restart_CS)
     ! Register the tracer for horizontal advection, diffusion, and restarts.
     call register_tracer(tr_ptr, tr_Reg, param_file, HI, GV, &
                          tr_desc=CS%tr_desc(m), registry_diags=.true., &
-                         restart_CS=restart_CS, mandatory=.not.CS%tracers_may_reinit)
+                         restart_CS=restart_CS, mandatory=.not.CS%tracers_may_reinit,&
+                         advect_scheme=advect_scheme)
 
     !   Set coupled_tracers to be true (hard-coded above) to provide the surface
     ! values to the coupler (if any).  This is meta-code and its arguments will
@@ -190,12 +208,13 @@ end function register_dye_tracer
 
 !> This subroutine initializes the CS%ntr tracer fields in tr(:,:,:,:)
 !! and it sets up the tracer output.
-subroutine initialize_dye_tracer(restart, day, G, GV, h, diag, OBC, CS, sponge_CSp, tv)
+subroutine initialize_dye_tracer(restart, day, G, GV, US, h, diag, OBC, CS, sponge_CSp, tv)
   logical,                            intent(in) :: restart !< .true. if the fields have already been
                                                             !! read from a restart file.
   type(time_type), target,            intent(in) :: day  !< Time of the start of the run.
   type(ocean_grid_type),              intent(in) :: G    !< The ocean's grid structure
   type(verticalGrid_type),            intent(in) :: GV   !< The ocean's vertical grid structure
+  type(unit_scale_type),              intent(in) :: US   !< A dimensional unit scaling type
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in) :: h !< Layer thicknesses [H ~> m or kg m-2]
   type(diag_ctrl), target,            intent(in) :: diag !< Structure used to regulate diagnostic output.
   type(ocean_OBC_type),               pointer    :: OBC  !< This open boundary condition type specifies
@@ -208,6 +227,7 @@ subroutine initialize_dye_tracer(restart, day, G, GV, h, diag, OBC, CS, sponge_C
   type(thermo_var_ptrs),              intent(in) :: tv   !< A structure pointing to various thermodynamic variables
 
   ! Local variables
+  character(len=64)  :: var_name, longname
   real    :: dz(SZI_(G),SZK_(GV)) ! Height change across layers [Z ~> m]
   real    :: z_bot    ! Height of the bottom of the layer relative to the sea surface [Z ~> m]
   real    :: z_center ! Height of the center of the layer relative to the sea surface [Z ~> m]
@@ -217,6 +237,14 @@ subroutine initialize_dye_tracer(restart, day, G, GV, h, diag, OBC, CS, sponge_C
   if (CS%ntr < 1) return
 
   CS%diag => diag
+
+  ! Register vertical flux diagnostic
+  do m = 1, CS%ntr
+    write(var_name,'(A,I3.3,A)') "dye",m,"_dia_diff"
+    write(longname,'(A,I3.3,A)') "Vertical diffusive flux of dye ",m," (positive up)"
+    CS%id_tr_dia_diff(m) = register_diag_field('ocean_model', trim(var_name), &
+        diag%axesTi, day, trim(longname), 'conc H s-1', conversion=GV%H_to_MKS*US%s_to_T)
+  enddo
 
   ! Establish location of source
   do j=G%jsc,G%jec
@@ -278,15 +306,20 @@ subroutine dye_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, G, GV, US
 
   ! Local variables
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: h_work ! Used so that h can be modified [H ~> m or kg m-2]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1) :: vert_flux ! Vertical tracer flux positive upward
+                                              !! [conc H T-1 ~> conc m s-1]
   real    :: dz(SZI_(G),SZK_(GV)) ! Height change across layers [Z ~> m]
   real    :: z_bot    ! Height of the bottom of the layer relative to the sea surface [Z ~> m]
   real    :: z_center ! Height of the center of the layer relative to the sea surface [Z ~> m]
+  real    :: Idt      ! Inverse of timestep [T-1 ~> s-1]
   integer :: i, j, k, is, ie, js, je, nz, m
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
 
   if (.not.associated(CS)) return
   if (CS%ntr < 1) return
+
+  Idt = 1.0 / dt
 
   if (present(evap_CFL_limit) .and. present(minimum_forcing_depth)) then
     do m=1,CS%ntr
@@ -296,10 +329,34 @@ subroutine dye_tracer_column_physics(h_old, h_new, ea, eb, fluxes, dt, G, GV, US
       call applyTracerBoundaryFluxesInOut(G, GV, CS%tr(:,:,:,m), dt, fluxes, h_work, &
                                           evap_CFL_limit, minimum_forcing_depth)
       call tracer_vertdiff(h_work, ea, eb, dt, CS%tr(:,:,:,m), G, GV)
+
+      ! Calculate net vertical flux from entrainment
+      ! Net flux = upward component - downward component
+      ! Upward (from below): eb(k) * tr(k+1), Downward (from above): ea(k+1) * tr(k)
+      do K=2,nz ; do j=js,je ; do i=is,ie
+        vert_flux(i,j,K) = (eb(i,j,k-1) * CS%tr(i,j,k,m) - ea(i,j,k) * CS%tr(i,j,k-1,m)) * Idt
+      enddo ; enddo ; enddo
+      do j=js,je ; do i=is,ie ; vert_flux(i,j,1) = 0.0 ; vert_flux(i,j,nz+1) = 0.0 ; enddo ; enddo
+
+      ! Post diagnostic
+      if (CS%id_tr_dia_diff(m) > 0) &
+        call post_data(CS%id_tr_dia_diff(m), vert_flux, CS%diag)
     enddo
   else
     do m=1,CS%ntr
       call tracer_vertdiff(h_old, ea, eb, dt, CS%tr(:,:,:,m), G, GV)
+
+      ! Calculate net vertical flux from entrainment
+      ! Net flux = upward component - downward component
+      ! Upward (from below): eb(k) * tr(k+1), Downward (from above): ea(k+1) * tr(k)
+      do K=2,nz ; do j=js,je ; do i=is,ie
+        vert_flux(i,j,K) = (eb(i,j,k-1) * CS%tr(i,j,k,m) - ea(i,j,k) * CS%tr(i,j,k-1,m)) * Idt
+      enddo ; enddo ; enddo
+      do j=js,je ; do i=is,ie ; vert_flux(i,j,1) = 0.0 ; vert_flux(i,j,nz+1) = 0.0 ; enddo ; enddo
+
+      ! Post diagnostic
+      if (CS%id_tr_dia_diff(m) > 0) &
+        call post_data(CS%id_tr_dia_diff(m), vert_flux, CS%diag)
     enddo
   endif
 
@@ -420,5 +477,8 @@ end subroutine regional_dyes_end
 !!  are set to 1 within the geographical region specified. The depth
 !!  which a tracer is set is determined by calculating the depth from
 !!  the seafloor upwards through the column.
+!!
+!! The advection scheme of these tracers can be set to be different
+!! to that used by active tracers.
 
 end module regional_dyes

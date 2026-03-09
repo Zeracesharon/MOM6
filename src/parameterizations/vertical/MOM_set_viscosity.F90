@@ -16,6 +16,7 @@ use MOM_domains,       only : pass_var, CORNER
 use MOM_EOS,           only : calculate_density, calculate_density_derivs, calculate_specific_vol_derivs
 use MOM_error_handler, only : MOM_error, FATAL, WARNING
 use MOM_file_parser,   only : get_param, log_param, log_version, param_file_type
+use MOM_file_parser,   only : openParameterBlock, closeParameterBlock
 use MOM_forcing_type,  only : forcing, mech_forcing, find_ustar
 use MOM_grid,          only : ocean_grid_type
 use MOM_hor_index,     only : hor_index_type
@@ -74,6 +75,8 @@ type, public :: set_visc_CS ; private
                             !! actual velocity in the bottommost `HBBL`, depending
                             !! on whether linear_drag is true.
                             !! Runtime parameter `BOTTOMDRAGLAW`.
+  logical :: bottomdragmap  !< If true, apply the spatially varying drag coefficient (cdrag_2d)
+                            !! instead of the spatially uniform drag coefficient (cdrag).
   logical :: body_force_drag !< If true, the bottom stress is imposed as an explicit body force
                             !! applied over a fixed distance from the bottom, rather than as an
                             !! implicit calculation based on an enhanced near-bottom viscosity.
@@ -86,6 +89,12 @@ type, public :: set_visc_CS ; private
   real    :: Chan_drag_max_vol !< The maximum bottom boundary layer volume within which the
                             !! channel drag is applied, normalized by the full cell area,
                             !! or a negative value to apply no maximum [Z ~> m].
+  real    :: channel_break_depth !< When CHANNEL_DRAG is true, the bathymetric depth interpolated
+                            !! to the vorticity point is a combination of the harmonic mean of the
+                            !! adjacent velocity point depths below this depth [Z ~> m] and the
+                            !! arithmetic mean of the adjacent depths above it, to roughly mimic a
+                            !! continental shelf break profile.  The internal version of this depth
+                            !! uses the same offset (G%Z_ref) as the bathymetry.
   logical :: correct_BBL_bounds !< If true, uses the correct bounds on the BBL thickness and
                             !! viscosity so that the bottom layer feels the intended drag.
   logical :: RiNo_mix       !< If true, use Richardson number dependent mixing.
@@ -102,6 +111,10 @@ type, public :: set_visc_CS ; private
   real    :: omega_frac     !<   When setting the decay scale for turbulence, use this
                             !! fraction of the absolute rotation rate blended with the local
                             !! value of f, as sqrt((1-of)*f^2 + of*4*omega^2) [nondim]
+  real    :: tideampfac2    !< A factor to multiply by tideamp to convert to a mean ustar,
+                            !! accounts for conversion of amplitude to mean magnitude over
+                            !! a time average much longer than the tidal periods and for
+                            !! non-commuting conversion of mean tideamp to mean ustar**3 [nondim]
   logical :: concave_trigonometric_L  !< If true, use trigonometric expressions to determine the
                             !! fractional open interface lengths for concave topography.
   integer :: answer_date    !< The vintage of the order of arithmetic and expressions in the set
@@ -116,6 +129,8 @@ type, public :: set_visc_CS ; private
   type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to
                             !! regulate the timing of diagnostic output.
   ! Allocatable data arrays
+  real, allocatable, dimension(:,:) :: cdrag_u !< The spatially varying quadratic drag coefficient [nondim]
+  real, allocatable, dimension(:,:) :: cdrag_v !< The spatially varying quadratic drag coefficient [nondim]
   real, allocatable, dimension(:,:) :: tideamp !< RMS tidal amplitude at h points [Z T-1 ~> m s-1]
   ! Diagnostic arrays
   real, allocatable, dimension(:,:) :: bbl_u !< BBL mean U current [L T-1 ~> m s-1]
@@ -196,7 +211,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
     S_vel, &    ! Arithmetic mean of the layer salinities adjacent to a
                 ! velocity point [S ~> ppt].
     SpV_vel, &  ! Arithmetic mean of the layer averaged specific volumes adjacent to a
-                ! velocity point [R-1 ~> kg m-3].
+                ! velocity point [R-1 ~> m3 kg-1].
     Rml_vel     ! Arithmetic mean of the layer coordinate densities adjacent
                 ! to a velocity point [R ~> kg m-3].
   real :: dz(SZI_(G),SZJ_(G),SZK_(GV)) ! Height change across layers [Z ~> m]
@@ -206,6 +221,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   real :: ustarsq          ! 400 times the square of ustar, times
                            ! Rho0 divided by G_Earth and the conversion
                            ! from m to thickness units [H R ~> kg m-2 or kg2 m-5].
+  real :: cdrag            ! The drag coefficient [nondim].
   real :: cdrag_sqrt       ! Square root of the drag coefficient [nondim].
   real :: cdrag_sqrt_H     ! Square root of the drag coefficient, times a unit conversion factor
                            ! from lateral lengths to layer thicknesses [H L-1 ~> nondim or kg m-3].
@@ -241,7 +257,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
                            ! magnitudes [H L T-1 ~> m2 s-1 or kg m-1 s-1].
   real :: Thtot            ! Running sum of thickness times temperature [C H ~> degC m or degC kg m-2].
   real :: Shtot            ! Running sum of thickness times salinity [S H ~> ppt m or ppt kg m-2].
-  real :: SpV_htot         ! Running sum of thickness times specific volume [R-1 H ~> m4 kg-1 or m]
+  real :: SpV_htot         ! Running sum of thickness times specific volume [H R-1 ~> m4 kg-1 or m]
   real :: hweight          ! The thickness of a layer that is within Hbbl
                            ! of the bottom [H ~> m or kg m-2].
   real :: dzweight         ! The counterpart of hweight in height units [Z ~> m].
@@ -254,8 +270,11 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   real :: p_ref(SZI_(G))   !   The pressure used to calculate the coordinate
                            ! density [R L2 T-2 ~> Pa] (usually set to 2e7 Pa = 2000 dbar).
 
-  real :: D_vel            ! The bottom depth at a velocity point [Z ~> m].
-  real :: Dp, Dm           ! The depths at the edges of a velocity cell [Z ~> m].
+  real :: D_vel            ! The bottom depth relative to the shelfbreak depth at a velocity point [Z ~> m].
+  real :: Dp, Dm           ! The bottom depths at the edges of a velocity cell relative to the
+                           ! shelfbreak depth [Z ~> m].
+  real :: D_vel_p, D_vel_m ! The bottom depths in adjacent velocity points relative to the
+                           ! shelfbreak depth [Z ~> m].
   real :: crv              ! crv is the curvature of the bottom depth across a
                            ! cell, times the cell width squared [Z ~> m].
   real :: slope            ! The absolute value of the bottom depth slope across
@@ -300,11 +319,13 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   real :: h_bbl_fr         ! The fraction of the bottom boundary layer in a layer [nondim].
   real :: h_sum            ! The sum of the thicknesses of the layers below the one being
                            ! worked on [H ~> m or kg m-2].
+  real :: tideampfac2_x_0p5 ! tideampfac2 multiplied by the c-grid averaging factor of 0.5
   real, parameter :: C1_3 = 1.0/3.0, C1_6 = 1.0/6.0, C1_12 = 1.0/12.0 ! Rational constants [nondim]
   real :: tmp              ! A temporary variable, sometimes in [Z ~> m]
   logical :: use_BBL_EOS, do_i(SZIB_(G))
   integer, dimension(2) :: EOSdom ! The computational domain for the equation of state
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, m, n, K2, nkmb, nkml
+  integer :: is_OBC, ie_OBC, js_OBC, je_OBC
   type(ocean_OBC_type), pointer :: OBC => NULL()
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
@@ -313,7 +334,8 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   h_neglect = GV%H_subroundoff
   dz_neglect = GV%dZ_subroundoff
 
-  Rho0x400_G = 400.0*(GV%H_to_RZ / (US%L_to_Z**2 * GV%g_Earth))
+  Rho0x400_G = 400.0*(GV%H_to_RZ / GV%g_Earth_Z_T2)
+  tideampfac2_x_0p5 = CS%tideampfac2*0.5
 
   if (.not.CS%initialized) call MOM_error(FATAL,"MOM_set_viscosity(BBL): "//&
          "Module must be initialized before it is used.")
@@ -338,11 +360,13 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   use_BBL_EOS = associated(tv%eqn_of_state) .and. CS%BBL_use_EOS
   OBC => CS%OBC
 
-  cdrag_sqrt = sqrt(CS%cdrag)
-  cdrag_sqrt_H = cdrag_sqrt * US%L_to_m * GV%m_to_H
-  cdrag_sqrt_H_RL = cdrag_sqrt * US%L_to_Z * GV%RZ_to_H
-  cdrag_L_to_H = CS%cdrag * US%L_to_m * GV%m_to_H
-  cdrag_RL_to_H = CS%cdrag * US%L_to_Z * GV%RZ_to_H
+  if (.not.CS%bottomdragmap) then
+    cdrag_sqrt = sqrt(CS%cdrag)
+    cdrag_sqrt_H = cdrag_sqrt * US%L_to_m * GV%m_to_H
+    cdrag_sqrt_H_RL = cdrag_sqrt * US%L_to_Z * GV%RZ_to_H
+    cdrag_L_to_H = CS%cdrag * US%L_to_m * GV%m_to_H
+    cdrag_RL_to_H = CS%cdrag * US%L_to_Z * GV%RZ_to_H
+  endif
   BBL_thick_max = G%Rad_Earth_L * US%L_to_Z
   K2 = max(nkmb+1, 2)
 
@@ -364,32 +388,52 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
 
   !$OMP parallel do default(shared)
   do J=js-1,je ; do i=is-1,ie+1
-    D_v(i,J) = 0.5*(G%bathyT(i,j) + G%bathyT(i,j+1)) + G%Z_ref
+    D_v(i,J) = 0.5*(G%bathyT(i,j) + G%bathyT(i,j+1))
     mask_v(i,J) = G%mask2dCv(i,J)
   enddo ; enddo
   !$OMP parallel do default(shared)
   do j=js-1,je+1 ; do I=is-1,ie
-    D_u(I,j) = 0.5*(G%bathyT(i,j) + G%bathyT(i+1,j)) + G%Z_ref
+    D_u(I,j) = 0.5*(G%bathyT(i,j) + G%bathyT(i+1,j))
     mask_u(I,j) = G%mask2dCu(I,j)
   enddo ; enddo
 
-  if (associated(OBC)) then ; do n=1,OBC%number_of_segments
-    if (.not. OBC%segment(n)%on_pe) cycle
+  if (associated(OBC) .and. CS%Channel_drag) then
     ! Use a one-sided projection of bottom depths at OBC points.
-    I = OBC%segment(n)%HI%IsdB ; J = OBC%segment(n)%HI%JsdB
-    if (OBC%segment(n)%is_N_or_S .and. (J >= js-1) .and. (J <= je)) then
-      do i = max(is-1,OBC%segment(n)%HI%isd), min(ie+1,OBC%segment(n)%HI%ied)
-        if (OBC%segment(n)%direction == OBC_DIRECTION_N) D_v(i,J) = G%bathyT(i,j) + G%Z_ref
-        if (OBC%segment(n)%direction == OBC_DIRECTION_S) D_v(i,J) = G%bathyT(i,j+1) + G%Z_ref
-      enddo
-    elseif (OBC%segment(n)%is_E_or_W .and. (I >= is-1) .and. (I <= ie)) then
-      do j = max(js-1,OBC%segment(n)%HI%jsd), min(je+1,OBC%segment(n)%HI%jed)
-        if (OBC%segment(n)%direction == OBC_DIRECTION_E) D_u(I,j) = G%bathyT(i,j) + G%Z_ref
-        if (OBC%segment(n)%direction == OBC_DIRECTION_W) D_u(I,j) = G%bathyT(i+1,j) + G%Z_ref
-      enddo
+    if (OBC%v_N_OBCs_on_PE) then
+      Js_OBC = max(js-1, OBC%Js_v_N_obc) ; Je_OBC = min(je, OBC%Je_v_N_obc)
+      is_OBC = max(is-1, OBC%is_v_N_obc) ; ie_OBC = min(ie+1, OBC%ie_v_N_obc)
+      !$OMP parallel do default(shared)
+      do J=Js_OBC,Je_OBC ; do i=is_OBC,ie_OBC
+        if (OBC%segnum_v(i,J) > 0) D_v(i,J) = G%bathyT(i,j) !  OBC_DIRECTION_N
+      enddo ; enddo
     endif
-  enddo ; endif
-  if (associated(OBC)) then ; do n=1,OBC%number_of_segments
+    if (OBC%v_S_OBCs_on_PE) then
+      Js_OBC = max(js-1, OBC%Js_v_S_obc) ; Je_OBC = min(je, OBC%Je_v_S_obc)
+      is_OBC = max(is-1, OBC%is_v_S_obc) ; ie_OBC = min(ie+1, OBC%ie_v_S_obc)
+      !$OMP parallel do default(shared)
+      do J=Js_OBC,Je_OBC ; do i=is_OBC,ie_OBC
+        if (OBC%segnum_v(i,J) < 0) D_v(i,J) = G%bathyT(i,j+1) !  OBC_DIRECTION_S
+      enddo ; enddo
+    endif
+    if (OBC%u_E_OBCs_on_PE) then
+      js_OBC = max(js-1, OBC%js_u_E_obc) ; je_OBC = min(je+1, OBC%je_u_E_obc)
+      Is_OBC = max(is-1, OBC%Is_u_E_obc) ; Ie_OBC = min(ie, OBC%Ie_u_E_obc)
+      !$OMP parallel do default(shared)
+      do j=js_OBC,je_OBC ; do I=Is_OBC,Ie_OBC
+        if (OBC%segnum_u(I,j) > 0) D_u(I,j) = G%bathyT(i,j) !  OBC_DIRECTION_E
+      enddo ; enddo
+    endif
+    if (OBC%u_W_OBCs_on_PE) then
+      js_OBC = max(js-1, OBC%js_u_W_obc) ; je_OBC = min(je+1, OBC%je_u_W_obc)
+      Is_OBC = max(is-1, OBC%Is_u_W_obc) ; Ie_OBC = min(ie, OBC%Ie_u_W_obc)
+      !$OMP parallel do default(shared)
+      do j=js_OBC,je_OBC ; do I=Is_OBC,Ie_OBC
+        if (OBC%segnum_u(I,j) < 0) D_u(I,j) = G%bathyT(i+1,j) !  OBC_DIRECTION_W
+      enddo ; enddo
+    endif
+  endif
+
+  if (associated(OBC) .and. CS%Channel_drag) then ; do n=1,OBC%number_of_segments
     ! Now project bottom depths across cell-corner points in the OBCs.  The two
     ! projections have to occur in sequence and can not be combined easily.
     if (.not. OBC%segment(n)%on_pe) cycle
@@ -416,6 +460,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
 
   if (.not.use_BBL_EOS) Rml_vel(:,:) = 0.0
 
+  ! Resetting Ray_[uv] is required by body force drag.
   if (allocated(visc%Ray_u)) visc%Ray_u(:,:,:) = 0.0
   if (allocated(visc%Ray_v)) visc%Ray_v(:,:,:) = 0.0
 
@@ -504,8 +549,8 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
     if (associated(OBC)) then ; if (OBC%number_of_segments > 0) then
       ! Apply a zero gradient projection of thickness across OBC points.
       if (m==1) then
-        do I=is,ie ; if (do_i(I) .and. (OBC%segnum_u(I,j) /= OBC_NONE)) then
-          if (OBC%segment(OBC%segnum_u(I,j))%direction == OBC_DIRECTION_E) then
+        do I=is,ie ; if (do_i(I) .and. (OBC%segnum_u(I,j) /= 0)) then
+          if (OBC%segnum_u(I,j) > 0) then  ! OBC_DIRECTION_E
             do k=1,nz
               h_at_vel(I,k) = h(i,j,k) ; h_vel(I,k) = h(i,j,k)
               dz_at_vel(I,k) = dz(i,j,k) ; dz_vel(I,k) = dz(i,j,k)
@@ -522,7 +567,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
             if (allocated(tv%SpV_avg)) then ; do k=1,nz
               SpV_vel(I,k) = tv%SpV_avg(i,j,k)
             enddo ; endif
-          elseif (OBC%segment(OBC%segnum_u(I,j))%direction == OBC_DIRECTION_W) then
+          elseif (OBC%segnum_u(I,j) < 0) then  ! OBC_DIRECTION_W
             do k=1,nz
               h_at_vel(I,k) = h(i+1,j,k) ; h_vel(I,k) = h(i+1,j,k)
               dz_at_vel(I,k) = dz(i+1,j,k) ; dz_vel(I,k) = dz(i+1,j,k)
@@ -542,8 +587,8 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
           endif
         endif ; enddo
       else
-        do i=is,ie ; if (do_i(i) .and. (OBC%segnum_v(i,J) /= OBC_NONE)) then
-          if (OBC%segment(OBC%segnum_v(i,J))%direction == OBC_DIRECTION_N) then
+        do i=is,ie ; if (do_i(i) .and. (OBC%segnum_v(i,J) /= 0)) then
+          if (OBC%segnum_v(i,J) > 0) then  ! OBC_DIRECTION_N
             do k=1,nz
               h_at_vel(i,k) = h(i,j,k) ; h_vel(i,k) = h(i,j,k)
               dz_at_vel(i,k) = dz(i,j,k) ; dz_vel(i,k) = dz(i,j,k)
@@ -560,7 +605,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
             if (allocated(tv%SpV_avg)) then ; do k=1,nz
               SpV_vel(i,k) = tv%SpV_avg(i,j,k)
             enddo ;  endif
-          elseif (OBC%segment(OBC%segnum_v(i,J))%direction == OBC_DIRECTION_S) then
+          elseif (OBC%segnum_v(i,J) < 0) then  ! OBC_DIRECTION_S
             do k=1,nz
               h_at_vel(i,k) = h(i,j+1,k) ; h_vel(i,k) = h(i,j+1,k)
               dz_at_vel(i,k) = dz(i,j+1,k) ; dz_vel(i,k) = dz(i,j+1,k)
@@ -582,6 +627,21 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
       endif
     endif ; endif
 
+    ! Set the "back ground" friction velocity scale to either the tidal amplitude or place-holder constant
+    if (CS%BBL_use_tidal_bg) then
+      do i=is,ie ; if (do_i(i)) then ; if (m==1) then
+        u2_bg(I) = tideampfac2_x_0p5 * ( G%mask2dT(i,j)*(CS%tideamp(i,j)*CS%tideamp(i,j))+ &
+                         G%mask2dT(i+1,j)*(CS%tideamp(i+1,j)*CS%tideamp(i+1,j)) )
+      else
+        u2_bg(i) = tideampfac2_x_0p5 * ( G%mask2dT(i,j)*(CS%tideamp(i,j)*CS%tideamp(i,j))+ &
+                         G%mask2dT(i,j+1)*(CS%tideamp(i,j+1)*CS%tideamp(i,j+1)) )
+      endif ; endif ; enddo
+    else
+      do i=is,ie ; if (do_i(i)) then
+        u2_bg(i) = CS%drag_bg_vel * CS%drag_bg_vel
+      endif ; enddo
+    endif
+
     if (use_BBL_EOS .or. CS%body_force_drag .or. .not.CS%linear_drag) then
       ! Calculate the mean velocity magnitude over the bottommost CS%Hbbl of
       ! the water column for determining the quadratic bottom drag.
@@ -591,18 +651,16 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
         dztot_vel = 0.0 ; dzwtot = 0.0
         Thtot = 0.0 ; Shtot = 0.0 ; SpV_htot = 0.0
 
-        ! Set the "back ground" friction velocity scale to either the tidal amplitude or place-holder constant
-        if (CS%BBL_use_tidal_bg) then
+        if (CS%bottomdragmap) then
           if (m==1) then
-            u2_bg(I) = 0.5*( G%mask2dT(i,j)*(CS%tideamp(i,j)*CS%tideamp(i,j))+ &
-                             G%mask2dT(i+1,j)*(CS%tideamp(i+1,j)*CS%tideamp(i+1,j)) )
+            cdrag_sqrt = sqrt(CS%cdrag_u(i,j))
           else
-            u2_bg(i) = 0.5*( G%mask2dT(i,j)*(CS%tideamp(i,j)*CS%tideamp(i,j))+ &
-                              G%mask2dT(i,j+1)*(CS%tideamp(i,j+1)*CS%tideamp(i,j+1)) )
+            cdrag_sqrt = sqrt(CS%cdrag_v(i,j))
           endif
-        else
-          u2_bg(i) = CS%drag_bg_vel * CS%drag_bg_vel
+          cdrag_sqrt_H = cdrag_sqrt * US%L_to_m * GV%m_to_H
+          cdrag_sqrt_H_RL = cdrag_sqrt * US%L_to_Z * GV%RZ_to_H
         endif
+
         do k=nz,1,-1
 
           if (htot_vel>=CS%Hbbl) exit ! terminate the k loop
@@ -666,7 +724,17 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
 
       endif ; enddo
     else
-      do i=is,ie ; ustar(i) = cdrag_sqrt_H*CS%drag_bg_vel ; enddo
+      do i=is,ie
+        if (CS%bottomdragmap) then
+          if (m==1) then
+            cdrag_sqrt = sqrt(CS%cdrag_u(i,j))
+          else
+            cdrag_sqrt = sqrt(CS%cdrag_v(i,j))
+          endif
+          cdrag_sqrt_H = cdrag_sqrt * US%L_to_m * GV%m_to_H
+        endif
+        ustar(i) = cdrag_sqrt_H * CS%drag_bg_vel
+      enddo
     endif ! Not linear_drag
 
     if (use_BBL_EOS) then
@@ -696,6 +764,16 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
       ustarsq = Rho0x400_G * ustar(i)**2 ! Note not in units of u*^2 but [H R ~> kg m-2 or kg2 m-5]
       htot = 0.0
       dztot = 0.0
+
+      if (CS%bottomdragmap) then
+        if (m==1) then
+          cdrag = CS%cdrag_u(i,j)
+        else
+          cdrag = CS%cdrag_v(i,j)
+        endif
+        cdrag_L_to_H = cdrag * US%L_to_m * GV%m_to_H
+        cdrag_RL_to_H = cdrag * US%L_to_Z * GV%RZ_to_H
+      endif
 
       ! Calculate the thickness of a stratification limited BBL ignoring rotation:
       !   h_N = Ci u* / N          (limit of KW99 eq. 2.20 for |f|->0)
@@ -802,19 +880,6 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
       if (m==1) then ; C2f = G%CoriolisBu(I,J-1) + G%CoriolisBu(I,J)
       else ; C2f = G%CoriolisBu(I-1,J) + G%CoriolisBu(I,J) ; endif
 
-      ! Set the "back ground" friction velocity scale to either the tidal amplitude or place-holder constant
-      if (CS%BBL_use_tidal_bg) then
-        if (m==1) then
-          u2_bg(I) = 0.5*( G%mask2dT(i,j)*(CS%tideamp(i,j)*CS%tideamp(i,j))+ &
-                           G%mask2dT(i+1,j)*(CS%tideamp(i+1,j)*CS%tideamp(i+1,j)) )
-        else
-          u2_bg(i) = 0.5*( G%mask2dT(i,j)*(CS%tideamp(i,j)*CS%tideamp(i,j))+ &
-                            G%mask2dT(i,j+1)*(CS%tideamp(i,j+1)*CS%tideamp(i,j+1)) )
-        endif
-      else
-        u2_bg(i) = CS%drag_bg_vel * CS%drag_bg_vel
-      endif
-
       ! The thickness of a rotation limited BBL ignoring stratification is
       !   h_f ~ Cn u* / f        (limit of KW99 eq. 2.20 for N->0).
       ! The buoyancy limit of BBL thickness (h_N) is already in the variable htot from above.
@@ -869,19 +934,29 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
           vol_below(K) = vol_below(K+1) + dz_vel(i,k)
         enddo
 
-        !### The harmonic mean edge depths here are not invariant to offsets!
+        ! Find the bathymetry at adjacent points relative to the shelf break.  For now this
+        ! shelf break depth is set with a global constant, but it could vary in space.
         if (m==1) then
-          D_vel = D_u(I,j)
-          tmp = G%mask2dCu(I,j+1) * D_u(I,j+1)
-          Dp = 2.0 * D_vel * tmp / (D_vel + tmp)
-          tmp = G%mask2dCu(I,j-1) * D_u(I,j-1)
-          Dm = 2.0 * D_vel * tmp / (D_vel + tmp)
+          D_vel = D_u(I,j) - CS%channel_break_depth
+          D_vel_p = G%mask2dCu(I,j+1) * (D_u(I,j+1) - CS%channel_break_depth)
+          D_vel_m = G%mask2dCu(I,j-1) * (D_u(I,j-1) - CS%channel_break_depth)
         else
-          D_vel = D_v(i,J)
-          tmp = G%mask2dCv(i+1,J) * D_v(i+1,J)
-          Dp = 2.0 * D_vel * tmp / (D_vel + tmp)
-          tmp = G%mask2dCv(i-1,J) * D_v(i-1,J)
-          Dm = 2.0 * D_vel * tmp / (D_vel + tmp)
+          D_vel = D_v(i,J) - CS%channel_break_depth
+          D_vel_p = G%mask2dCv(i+1,J) * (D_v(i+1,J) - CS%channel_break_depth)
+          D_vel_m = G%mask2dCv(i-1,J) * (D_v(i-1,J) - CS%channel_break_depth)
+        endif
+        ! This profile uses a harmonic mean bottom depth below some reference value to
+        ! roughly mimic the topographic shape at and beneath a continental shelf break.
+        ! Above this a simple arithmetic mean is used.
+        if ((D_vel > 0.0) .and. (D_vel_p > 0.0)) then
+          Dp = 2.0 * D_vel * D_vel_p / (D_vel + D_vel_p)
+        else  ! This is above the shelf-break, noting that D is positive downward.
+          Dp = 0.5 * (min(D_vel, 0.0) + min(D_vel_p, 0.0))
+        endif
+        if ((D_vel > 0.0) .and. (D_vel_m > 0.0)) then
+          Dm = 2.0 * D_vel * D_vel_m / (D_vel + D_vel_m)
+        else  ! This is above the shelf-break, noting that D is positive downward.
+          Dm = 0.5 * (min(D_vel, 0.0) + min(D_vel_m, 0.0))
         endif
         if (Dm > Dp) then ; tmp = Dp ; Dp = Dm ; Dm = tmp ; endif
         crv = 3.0*(Dp + Dm - 2.0*D_vel)
@@ -1829,11 +1904,11 @@ function set_v_at_u(v, h, G, GV, i, j, k, mask2dCv, OBC)
   enddo ; enddo
 
   if (associated(OBC)) then ; if (OBC%number_of_segments > 0) then
-    do j0 = -1,0 ; do i0 = 0,1 ; if ((OBC%segnum_v(i+i0,J+j0) /= OBC_NONE)) then
+    do j0 = -1,0 ; do i0 = 0,1 ; if (OBC%segnum_v(i+i0,J+j0) /= 0) then
       i1 = i+i0 ; J1 = J+j0
-      if (OBC%segment(OBC%segnum_v(i1,j1))%direction == OBC_DIRECTION_N) then
+      if (OBC%segnum_v(i1,j1) > 0) then ! OBC_DIRECTION_N
         hwt(i0,j0) = 2.0 * h(i1,j1,k) * mask2dCv(i1,J1)
-      elseif (OBC%segment(OBC%segnum_v(i1,J1))%direction == OBC_DIRECTION_S) then
+      elseif (OBC%segnum_v(i1,J1) < 0) then !  OBC_DIRECTION_S
         hwt(i0,j0) = 2.0 * h(i1,J1+1,k) * mask2dCv(i1,J1)
       endif
     endif ; enddo ; enddo
@@ -1874,11 +1949,11 @@ function set_u_at_v(u, h, G, GV, i, j, k, mask2dCu, OBC)
   enddo ; enddo
 
   if (associated(OBC)) then ; if (OBC%number_of_segments > 0) then
-    do j0 = 0,1 ; do i0 = -1,0 ; if ((OBC%segnum_u(I+i0,j+j0) /= OBC_NONE)) then
+    do j0 = 0,1 ; do i0 = -1,0 ; if ((OBC%segnum_u(I+i0,j+j0) /= 0)) then
       I1 = I+i0 ; j1 = j+j0
-      if (OBC%segment(OBC%segnum_u(I1,j1))%direction == OBC_DIRECTION_E) then
+      if (OBC%segnum_u(I1,j1) > 0) then ! OBC_DIRECTION_E
         hwt(i0,j0) = 2.0 * h(I1,j1,k) * mask2dCu(I1,j1)
-      elseif (OBC%segment(OBC%segnum_u(I1,j1))%direction == OBC_DIRECTION_W) then
+      elseif (OBC%segnum_u(I1,j1) < 0) then ! OBC_DIRECTION_W
         hwt(i0,j0) = 2.0 * h(I1+1,j1,k) * mask2dCu(I1,j1)
       endif
     endif ; enddo ; enddo
@@ -1927,7 +2002,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS)
                 ! surface mixed layer [H C ~> m degC or kg degC m-2].
     Shtot, &    !   The integrated salt of layers that are within the
                 ! surface mixed layer [H S ~> m ppt or kg ppt m-2].
-    SpV_htot, & !   Running sum of thickness times specific volume [R-1 H ~> m4 kg-1 or m]
+    SpV_htot, & !   Running sum of thickness times specific volume [H R-1 ~> m4 kg-1 or m]
     Rhtot, &    !   The integrated density of layers that are within the surface mixed layer
                 ! [H R ~> kg m-2 or kg2 m-5].  Rhtot is only used if no
                 ! equation of state is used.
@@ -2045,7 +2120,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS)
   if (.not.(CS%dynamic_viscous_ML .or. associated(forces%frac_shelf_u) .or. &
             associated(forces%frac_shelf_v)) ) return
 
-  Rho0x400_G = 400.0*(GV%H_to_RZ / (US%L_to_Z**2 * GV%g_Earth))
+  Rho0x400_G = 400.0*(GV%H_to_RZ / GV%g_Earth_Z_T2)
   cdrag_sqrt = sqrt(CS%cdrag)
   cdrag_sqrt_H = cdrag_sqrt * US%L_to_m * GV%m_to_H
   cdrag_sqrt_H_RL = cdrag_sqrt * US%L_to_Z * GV%RZ_to_H
@@ -2099,8 +2174,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS)
   enddo ; enddo
 
   if (associated(OBC)) then ; do n=1,OBC%number_of_segments
-    ! Now project bottom depths across cell-corner points in the OBCs.  The two
-    ! projections have to occur in sequence and can not be combined easily.
+    ! Project bottom depths across cell-corner points in the OBCs.
     if (.not. OBC%segment(n)%on_pe) cycle
     ! Use a one-sided projection of bottom depths at OBC points.
     I = OBC%segment(n)%HI%IsdB ; J = OBC%segment(n)%HI%JsdB
@@ -2109,7 +2183,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS)
         if (OBC%segment(n)%direction == OBC_DIRECTION_N) mask_u(I,j+1) = 0.0
         if (OBC%segment(n)%direction == OBC_DIRECTION_S) mask_u(I,j) = 0.0
       enddo
-    elseif (OBC%segment(n)%is_E_or_W .and. (I >= is-1) .and. (I <= je)) then
+    elseif (OBC%segment(n)%is_E_or_W .and. (I >= is-1) .and. (I <= ie)) then
       do J = max(js-1,OBC%segment(n)%HI%JsdB), min(je,OBC%segment(n)%HI%JedB)
         if (OBC%segment(n)%direction == OBC_DIRECTION_E) mask_v(i+1,J) = 0.0
         if (OBC%segment(n)%direction == OBC_DIRECTION_W) mask_v(i,J) = 0.0
@@ -2318,7 +2392,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS)
         ustarsq = Rho0x400_G * ustar(i)**2
         htot(i) = 0.0 ; dztot(i) = 0.0
         if (use_EOS) then
-          Thtot(i) = 0.0 ; Shtot(i) = 0.0
+          Thtot(i) = 0.0 ; Shtot(i) = 0.0 ; oldfn = 0.0
           do k=1,nz-1
             if (h_at_vel(i,k) <= 0.0) cycle
             T_Lay = 0.5 * (tv%T(i,j,k) + tv%T(i+1,j,k))
@@ -2597,7 +2671,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS)
         htot(i) = 0.0
         dztot(i) = 0.0
         if (use_EOS) then
-          Thtot(i) = 0.0 ; Shtot(i) = 0.0
+          Thtot(i) = 0.0 ; Shtot(i) = 0.0 ; oldfn = 0.0
           do k=1,nz-1
             if (h_at_vel(i,k) <= 0.0) cycle
             T_Lay = 0.5 * (tv%T(i,j,k) + tv%T(i,j+1,k))
@@ -2785,8 +2859,12 @@ subroutine set_visc_register_restarts(HI, G, GV, US, param_file, visc, restart_C
                  default=.false., do_not_log=.true.)
   call get_param(param_file, mdl, "USE_IDEAL_AGE_TRACER", use_ideal_age, &
                  default=.false., do_not_log=.true.)
+  call openParameterBlock(param_file, 'MLE', do_not_log=.true.)
+    call get_param(param_file, mdl, "USE_BODNER23", MLE_use_Bodner, &
+                 default=.false., do_not_log=.true.)
+  call closeParameterBlock(param_file)
 
-  if (MLE_use_PBL_MLD) then
+  if (MLE_use_PBL_MLD .or. MLE_use_Bodner) then
     call safe_alloc_ptr(visc%MLD, isd, ied, jsd, jed)
   endif
   if ((hfreeze >= 0.0) .or. MLE_use_PBL_MLD .or. do_brine_plume .or. use_fpmix .or. &
@@ -2806,8 +2884,6 @@ subroutine set_visc_register_restarts(HI, G, GV, US, param_file, visc, restart_C
   endif
 
   ! visc%sfc_buoy_flx is used to communicate the state of the (e)PBL or KPP to the rest of the model
-  call get_param(param_file, mdl, "MLE%USE_BODNER23", MLE_use_Bodner, &
-                 default=.false., do_not_log=.true.)
   if (MLE_use_PBL_MLD .or. MLE_use_Bodner) then
     call safe_alloc_ptr(visc%sfc_buoy_flx, isd, ied, jsd, jed)
     call register_restart_field(visc%sfc_buoy_flx, "SFC_BFLX", .false., restart_CS, &
@@ -2885,8 +2961,15 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
                              ! is used in place of the absolute value of the local Coriolis
                              ! parameter in the denominator of some expressions [nondim]
   real    :: Chan_max_thick_dflt ! The default value for CHANNEL_DRAG_MAX_THICK [Z ~> m]
+  real    :: tideamp_factor  ! A factor to multiply by tideamp when converting to mean tidal magnitude [nondim]
+  real    :: shelfbreak_depth ! When CHANNEL_DRAG is true, the bathymetric depth interpolated
+                             ! to the vorticity point is a combination of the harmonic mean of the
+                             ! adjacent velocity point depths below this depth [Z ~> m] and the
+                             ! arithmetic mean of the adjacent depths above it, to roughly mimic a
+                             ! continental shelf break profile.
+  real, allocatable, dimension(:,:) :: cdrag_h !< The spatially varying quadratic drag coefficient [nondim]
 
-  integer :: i, j, k, is, ie, js, je
+  integer :: i, j, is, ie, js, je
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB, nz
   integer :: default_answer_date  ! The default setting for the various ANSWER_DATE flags.
   logical :: adiabatic, use_omega, MLE_use_PBL_MLD
@@ -2895,8 +2978,8 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
                              ! isopycnal or stacked shallow water mode.
   logical :: use_temperature ! If true, temperature and salinity are used as state variables.
   logical :: use_EOS         ! If true, density calculated from T & S using an equation of state.
-  character(len=200) :: filename, tideamp_file ! Input file names or paths
-  character(len=80)  :: tideamp_var ! Input file variable names
+  character(len=200) :: filename, cdrag_file, tideamp_file ! Input file names or paths
+  character(len=80)  :: cdrag_var, tideamp_var ! Input file variable names
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
   character(len=40)  :: mdl = "MOM_set_visc"  ! This module's name.
@@ -2938,8 +3021,18 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
                  default=.false., do_not_log=.not.CS%bottomdraglaw)
   call get_param(param_file, mdl, "CHANNEL_DRAG", CS%Channel_drag, &
                  "If true, the bottom drag is exerted directly on each "//&
-                 "layer proportional to the fraction of the bottom it "//&
-                 "overlies.", default=.false.)
+                 "layer proportional to the fraction of the bottom it overlies.", &
+                 default=.false.)
+  call get_param(param_file, mdl, "CHANNEL_DRAG_SHELFBREAK_DEPTH", shelfbreak_depth, &
+                 "When CHANNEL_DRAG is true, the bathymetric depth interpolated to the "//&
+                 "vorticity point is a combination of the harmonic mean of the adjacent "//&
+                 "velocity point depths below this depth and the arithmetic mean of the "//&
+                 "depths above it, to roughly mimic a continental shelf break profile.  "//&
+                 "Setting this to exceed MAXIMUM_DEPTH leads to linear interpolation of "//&
+                 "the topography between velocity points.", &
+                 default=0.0, units="m", scale=US%m_to_Z, do_not_log=.not.CS%Channel_drag)
+  CS%channel_break_depth = shelfbreak_depth - G%Z_ref
+
   call get_param(param_file, mdl, "LINEAR_DRAG", CS%linear_drag, &
                  "If LINEAR_DRAG and BOTTOMDRAGLAW are defined the drag "//&
                  "law is cdrag*DRAG_BG_VEL*u.", default=.false.)
@@ -2956,9 +3049,6 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
     CS%RiNo_mix = kappa_shear_is_used(param_file)
   endif
 
-  call get_param(param_file, mdl, "PRANDTL_TURB", visc%Prandtl_turb, &
-                 "The turbulent Prandtl number applied to shear "//&
-                 "instability.", units="nondim", default=1.0)
   call get_param(param_file, mdl, "DEBUG", CS%debug, default=.false.)
 
   call get_param(param_file, mdl, "DYNAMIC_VISCOUS_ML", CS%dynamic_viscous_ML, &
@@ -3015,6 +3105,16 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
                  "CDRAG is the drag coefficient relating the magnitude of "//&
                  "the velocity field to the bottom stress. CDRAG is only "//&
                  "used if BOTTOMDRAGLAW is defined.", units="nondim", default=0.003)
+    call get_param(param_file, mdl, "CDRAG_MAP", CS%bottomdragmap, &
+                 "If true, apply a spatially varying scaling factor to CDRAG, "//&
+                 "specified by CDRAG_VAR in CDRAG_FILE.", default=.false.)
+    call get_param(param_file, mdl, "CDRAG_FILE", cdrag_file, &
+                 "The name of the file with the spatially varying bottom drag "//&
+                 "scaling factor.", default="", do_not_log=.not.CS%bottomdragmap)
+    call get_param(param_file, mdl, "CDRAG_VAR", cdrag_var, &
+                 "The name of the variable in CDRAG_FILE with the spatially "//&
+                 "varying bottom drag scaling factor at h points.", &
+                 default="", do_not_log=.not.CS%bottomdragmap)
     call get_param(param_file, mdl, "BBL_USE_TIDAL_BG", CS%BBL_use_tidal_bg, &
                  "Flag to use the tidal RMS amplitude in place of constant "//&
                  "background velocity for computing u* in the BBL. "//&
@@ -3032,6 +3132,17 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
       ! nor dimensional testing in this mode. If we ever detect a dimensional sensitivity to
       ! this parameter, in this mode, then it means it is being used inappropriately.
       CS%drag_bg_vel = 1.e30
+      call get_param(param_file, mdl, "TIDEAMP_FACTOR", tideamp_factor, &
+                   "A parameter to multiply by tideamp when converting to ustar. "//&
+                   "It accounts for converting the amplitude to a mean magintude (approx 1/sqrt(2)) "//&
+                   "and possibly also for non-commuting averaging operators when converting to ustar**3. "//&
+                   "It is ignored if negative and uncapped so it can be greater than 1 if desired.",&
+                   units="nondim", default=-1.0)
+      if (tideamp_factor < 0.0) then
+        CS%tideampfac2 = 1.0
+      else
+        CS%tideampfac2 = tideamp_factor*tideamp_factor
+      endif
     else
       call get_param(param_file, mdl, "DRAG_BG_VEL", CS%drag_bg_vel, &
                    "DRAG_BG_VEL is either the assumed bottom velocity (with "//&
@@ -3139,7 +3250,8 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
     allocate(visc%kv_bbl_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(visc%kv_bbl_v(isd:ied,JsdB:JedB), source=0.0)
     allocate(visc%ustar_bbl(isd:ied,jsd:jed), source=0.0)
-    allocate(visc%TKE_bbl(isd:ied,jsd:jed), source=0.0)
+    allocate(visc%BBL_meanKE_loss(isd:ied,jsd:jed), source=0.0)
+    allocate(visc%BBL_meanKE_loss_sqrtCd(isd:ied,jsd:jed), source=0.0)
 
     CS%id_bbl_thick_u = register_diag_field('ocean_model', 'bbl_thick_u', &
        diag%axesCu1, Time, 'BBL thickness at u points', 'm', conversion=US%Z_to_m)
@@ -3158,6 +3270,27 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
        Time, 'BBL mean v current', 'm s-1', conversion=US%L_T_to_m_s)
     if (CS%id_bbl_v>0) then
       allocate(CS%bbl_v(isd:ied,JsdB:JedB), source=0.0)
+    endif
+    if (CS%bottomdragmap) then
+      if (len_trim(cdrag_file)==0 .or. len_trim(cdrag_var)==0) then
+        call MOM_error(FATAL,"CDRAG_FILE and CDRAG_VAR are required when using CDRAG_MAP.")
+      endif
+      allocate(cdrag_h(isd:ied,jsd:jed), source=0.0)
+      allocate(CS%cdrag_u(IsdB:IedB,jsd:jed), source=0.0)
+      allocate(CS%cdrag_v(isd:ied,JsdB:JedB), source=0.0)
+      filename = trim(CS%inputdir) // trim(cdrag_file)
+      call log_param(param_file, mdl, "INPUTDIR/CDRAG_FILE", filename)
+      call MOM_read_data(filename, cdrag_var, cdrag_h, G%domain, scale=CS%cdrag)
+      call pass_var(cdrag_h, G%domain)
+      do j=js,je ; do I=is-1,ie ; if (G%mask2dCu(I,j) > 0) then
+        CS%cdrag_u(I,j) = (G%mask2dT(i,j) * cdrag_h(i,j) + G%mask2dT(i+1,j) * cdrag_h(i+1,j)) / &
+                          (G%mask2dT(i,j) + G%mask2dT(i+1,j))
+      endif ; enddo ; enddo
+      do J=js-1,je ; do i=is,ie ; if (G%mask2dCv(i,J) > 0) then
+        CS%cdrag_v(i,J) = (G%mask2dT(i,j) * cdrag_h(i,j) + G%mask2dT(i,j+1) * cdrag_h(i,j+1)) / &
+                          (G%mask2dT(i,j) + G%mask2dT(i,j+1))
+      endif ; enddo ; enddo
+      deallocate(cdrag_h)
     endif
     if (CS%BBL_use_tidal_bg) then
       allocate(CS%tideamp(isd:ied,jsd:jed), source=0.0)
@@ -3214,7 +3347,8 @@ subroutine set_visc_end(visc, CS)
   if (associated(visc%Kv_shear)) deallocate(visc%Kv_shear)
   if (associated(visc%Kv_shear_Bu)) deallocate(visc%Kv_shear_Bu)
   if (allocated(visc%ustar_bbl)) deallocate(visc%ustar_bbl)
-  if (allocated(visc%TKE_bbl)) deallocate(visc%TKE_bbl)
+  if (allocated(visc%BBL_meanKE_loss)) deallocate(visc%BBL_meanKE_loss)
+  if (allocated(visc%BBL_meanKE_loss_sqrtCd)) deallocate(visc%BBL_meanKE_loss_sqrtCd)
   if (allocated(visc%taux_shelf)) deallocate(visc%taux_shelf)
   if (allocated(visc%tauy_shelf)) deallocate(visc%tauy_shelf)
   if (allocated(visc%tbl_thick_shelf_u)) deallocate(visc%tbl_thick_shelf_u)

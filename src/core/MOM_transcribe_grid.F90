@@ -56,6 +56,7 @@ subroutine copy_dyngrid_to_MOM_grid(dG, oG, US)
     oG%dyT(i,j) = dG%dyT(i+ido,j+jdo)
     oG%areaT(i,j) = dG%areaT(i+ido,j+jdo)
     oG%bathyT(i,j) = dG%bathyT(i+ido,j+jdo) - oG%Z_ref
+    oG%meanSL(i,j) = dG%meanSL(i+ido,j+jdo) + oG%Z_ref
 
     oG%dF_dx(i,j) = dG%dF_dx(i+ido,j+jdo)
     oG%dF_dy(i,j) = dG%dF_dy(i+ido,j+jdo)
@@ -135,15 +136,17 @@ subroutine copy_dyngrid_to_MOM_grid(dG, oG, US)
   ! Copy various scalar variables and strings.
   oG%x_axis_units = dG%x_axis_units ; oG%y_axis_units = dG%y_axis_units
   oG%x_ax_unit_short = dG%x_ax_unit_short ; oG%y_ax_unit_short = dG%y_ax_unit_short
+  oG%grid_unit_to_L = dG%grid_unit_to_L
   oG%areaT_global = dG%areaT_global ; oG%IareaT_global = dG%IareaT_global
   oG%south_lat = dG%south_lat ; oG%west_lon  = dG%west_lon
   oG%len_lat = dG%len_lat ; oG%len_lon = dG%len_lon
-  oG%Rad_Earth = dG%Rad_Earth ; oG%Rad_Earth_L = dG%Rad_Earth_L
+  oG%Rad_Earth_L = dG%Rad_Earth_L
   oG%max_depth = dG%max_depth
 
 ! Update the halos in case the dynamic grid has smaller halos than the ocean grid.
   call pass_var(oG%areaT, oG%Domain)
   call pass_var(oG%bathyT, oG%Domain)
+  call pass_var(oG%meanSL, oG%Domain)
   call pass_var(oG%geoLonT, oG%Domain)
   call pass_var(oG%geoLatT, oG%Domain)
   call pass_vector(oG%dxT, oG%dyT, oG%Domain, To_All+Scalar_Pair, AGRID)
@@ -216,6 +219,7 @@ subroutine copy_MOM_grid_to_dyngrid(oG, dG, US)
     dG%dyT(i,j) = oG%dyT(i+ido,j+jdo)
     dG%areaT(i,j) = oG%areaT(i+ido,j+jdo)
     dG%bathyT(i,j) = oG%bathyT(i+ido,j+jdo) + oG%Z_ref
+    dG%meanSL(i,j) = oG%meanSL(i+ido,j+jdo) - oG%Z_ref
 
     dG%dF_dx(i,j) = oG%dF_dx(i+ido,j+jdo)
     dG%dF_dy(i,j) = oG%dF_dy(i+ido,j+jdo)
@@ -296,15 +300,17 @@ subroutine copy_MOM_grid_to_dyngrid(oG, dG, US)
   ! Copy various scalar variables and strings.
   dG%x_axis_units = oG%x_axis_units ; dG%y_axis_units = oG%y_axis_units
   dG%x_ax_unit_short = oG%x_ax_unit_short ; dG%y_ax_unit_short = oG%y_ax_unit_short
+  dG%grid_unit_to_L = oG%grid_unit_to_L
   dG%areaT_global = oG%areaT_global ; dG%IareaT_global = oG%IareaT_global
   dG%south_lat = oG%south_lat ; dG%west_lon  = oG%west_lon
   dG%len_lat = oG%len_lat ; dG%len_lon = oG%len_lon
-  dG%Rad_Earth = oG%Rad_Earth ; dG%Rad_Earth_L = oG%Rad_Earth_L
+  dG%Rad_Earth_L = oG%Rad_Earth_L
   dG%max_depth = oG%max_depth
 
 ! Update the halos in case the dynamic grid has smaller halos than the ocean grid.
   call pass_var(dG%areaT, dG%Domain)
   call pass_var(dG%bathyT, dG%Domain)
+  call pass_var(dG%meanSL, dG%Domain)
   call pass_var(dG%geoLonT, dG%Domain)
   call pass_var(dG%geoLatT, dG%Domain)
   call pass_vector(dG%dxT, dG%dyT, dG%Domain, To_All+Scalar_Pair, AGRID)

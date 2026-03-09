@@ -26,8 +26,9 @@ type, public :: verticalGrid_type
   ! Commonly used parameters
   integer :: ke     !< The number of layers/levels in the vertical
   real :: max_depth !< The maximum depth of the ocean [Z ~> m].
-  real :: mks_g_Earth !< The gravitational acceleration in unscaled MKS units [m s-2].
+!  real :: mks_g_Earth !< The gravitational acceleration in unscaled MKS units [m s-2].  This might not be used.
   real :: g_Earth   !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2].
+  real :: g_Earth_Z_T2 !< The gravitational acceleration in alternatively rescaled units [Z T-2 ~> m s-2]
   real :: Rho0      !< The density used in the Boussinesq approximation or nominal
                     !! density used to convert depths into mass units [R ~> kg m-3].
 
@@ -73,7 +74,7 @@ type, public :: verticalGrid_type
   real :: H_to_m        !< A constant that translates distances in the units of thickness
                         !! to m [m H-1 ~> 1 or m3 kg-1].
   real :: H_to_Pa       !< A constant that translates the units of thickness to pressure
-                        !! [Pa H-1 = kg m-1 s-2 H-1 ~> kg m-2 s-2 or m s-2].
+                        !! [Pa H-1 ~> kg m-2 s-2 or m s-2].
   real :: H_to_Z        !< A constant that translates thickness units to the units of
                         !! depth [Z H-1 ~> 1 or m3 kg-1].
   real :: Z_to_H        !< A constant that translates depth units to thickness units
@@ -130,7 +131,7 @@ subroutine verticalGridInit( param_file, GV, US )
   call get_param(param_file, mdl, "RHO_0", GV%Rho0, &
                  "The mean ocean density used with BOUSSINESQ true to "//&
                  "calculate accelerations and the mass for conservation "//&
-                 "properties, or with BOUSSINSEQ false to convert some "//&
+                 "properties, or with BOUSSINESQ false to convert some "//&
                  "parameters from vertical units of m to kg m-2.", &
                  units="kg m-3", default=1035.0, scale=US%kg_m3_to_R)
   call get_param(param_file, mdl, "BOUSSINESQ", GV%Boussinesq, &
@@ -173,7 +174,8 @@ subroutine verticalGridInit( param_file, GV, US )
                  "units of thickness into m.", units="m H-1", default=1.0)
     GV%H_to_m = GV%H_to_m * H_rescale_factor
   endif
-  GV%mks_g_Earth = US%L_T_to_m_s**2*US%m_to_Z * GV%g_Earth
+  ! This is not used:  GV%mks_g_Earth = US%L_T_to_m_s**2*US%m_to_Z * GV%g_Earth
+  GV%g_Earth_Z_T2 = US%L_to_Z**2 * GV%g_Earth  ! This would result from scale=US%m_to_Z*US%T_to_s**2.
 #ifdef STATIC_MEMORY_
   ! Here NK_ is a macro, while nk is a variable.
   call get_param(param_file, mdl, "NK", nk, &

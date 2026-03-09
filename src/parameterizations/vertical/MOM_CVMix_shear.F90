@@ -94,7 +94,7 @@ subroutine calculate_CVMix_shear(u_H, v_H, h, tv, kd, kv, G, GV, US, CS )
   real :: epsln  !< Threshold to identify vanished layers [H ~> m or kg m-2]
 
   ! some constants
-  GoRho = US%L_to_Z**2 * GV%g_Earth / GV%Rho0
+  GoRho = GV%g_Earth_Z_T2 / GV%Rho0
   epsln = 1.e-10 * GV%m_to_H
 
   do j = G%jsc, G%jec
@@ -141,7 +141,7 @@ subroutine calculate_CVMix_shear(u_H, v_H, h, tv, kd, kv, G, GV, US, CS )
         if (GV%Boussinesq .or. GV%semi_Boussinesq) then
           dRho = GoRho * (rho_1D(kk+1) - rho_1D(kk+2))
         else
-          dRho = (US%L_to_Z**2 * GV%g_Earth) * (rho_1D(kk+1) - rho_1D(kk+2)) / (0.5*(rho_1D(kk+1) + rho_1D(kk+2)))
+          dRho = GV%g_Earth_Z_T2 * (rho_1D(kk+1) - rho_1D(kk+2)) / (0.5*(rho_1D(kk+1) + rho_1D(kk+2)))
         endif
         dz_int = 0.5*(dz(i,km1) + dz(i,k)) + GV%dZ_subroundoff
         N2 = DRHO / dz_int
@@ -264,8 +264,8 @@ logical function CVMix_shear_init(Time, G, GV, US, param_file, diag, CS)
   ! Otherwise, warn user and kill job.
   if ((NumberTrue) > 1) then
     call MOM_error(FATAL, 'MOM_CVMix_shear_init: '// &
-           'Multiple shear driven internal mixing schemes selected,'//&
-           ' please disable all but one scheme to proceed.')
+           'Multiple shear driven internal mixing schemes selected, '//&
+           'please disable all but one scheme to proceed.')
   endif
 
   CVMix_shear_init = use_PP81 .or. use_LMD94

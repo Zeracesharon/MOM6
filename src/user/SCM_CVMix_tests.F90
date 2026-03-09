@@ -183,7 +183,7 @@ subroutine SCM_CVMix_tests_surface_forcing_init(Time, G, param_file, CS)
   call get_param(param_file, mdl, "RHO_0", CS%Rho0, &
                  "The mean ocean density used with BOUSSINESQ true to "//&
                  "calculate accelerations and the mass for conservation "//&
-                 "properties, or with BOUSSINSEQ false to convert some "//&
+                 "properties, or with BOUSSINESQ false to convert some "//&
                  "parameters from vertical units of m to kg m-2.", &
                  units="kg m-3", default=1035.0, scale=US%kg_m3_to_R)
   call get_param(param_file, mdl, "RESTORE_FLUX_RHO", CS%rho_restore, &
@@ -202,7 +202,7 @@ subroutine SCM_CVMix_tests_wind_forcing(sfc_state, forces, day, G, US, CS)
   ! Local variables
   integer :: i, j, is, ie, js, je, Isq, Ieq, Jsq, Jeq
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
-  real    :: mag_tau  ! The magnitude of the wind stress [R L Z T-2 ~> Pa]
+  real    :: mag_tau  ! The magnitude of the wind stress [R Z2 T-2 ~> Pa]
   ! Bounds for loops and memory allocation
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB
@@ -217,9 +217,9 @@ subroutine SCM_CVMix_tests_wind_forcing(sfc_state, forces, day, G, US, CS)
   enddo ; enddo
   call pass_vector(forces%taux, forces%tauy, G%Domain, To_All)
 
-  mag_tau = sqrt((CS%tau_x*CS%tau_x) + (CS%tau_y*CS%tau_y))
+  mag_tau = US%L_to_Z * sqrt((CS%tau_x*CS%tau_x) + (CS%tau_y*CS%tau_y))
   if (associated(forces%ustar)) then ; do j=js,je ; do i=is,ie
-    forces%ustar(i,j) = sqrt( US%L_to_Z * mag_tau / CS%Rho0 )
+    forces%ustar(i,j) = sqrt( mag_tau / CS%Rho0 )
   enddo ; enddo ; endif
 
   if (associated(forces%tau_mag)) then ; do j=js,je ; do i=is,ie
@@ -251,7 +251,7 @@ subroutine SCM_CVMix_tests_buoyancy_forcing(sfc_state, fluxes, day, G, US, CS)
   IsdB = G%IsdB ; IedB = G%IedB ; JsdB = G%JsdB ; JedB = G%JedB
 
   if (CS%UseHeatFlux) then
-    ! Note CVMix test inputs give Heat flux in [Z C T-1 ~> m K/s]
+    ! Note CVMix test inputs give Heat flux in [Z C T-1 ~> m K s-1]
     ! therefore must convert to [Q R Z T-1 ~> W m-2] by multiplying
     ! by Rho0*Cp
     do J=Jsq,Jeq ; do i=is,ie
